@@ -1,0 +1,6 @@
+id=adguardhome
+name=AdGuard Home for Android
+version=1.2.2(0.107.78)
+versionCode=1202000
+author=Ceromis
+description=适用于 Magisk/KernelSU 的 AdGuard Home 本地 DNS 去广告模块，内置 ARM64 核心与原生控制应用，默认管理端口为 3000。

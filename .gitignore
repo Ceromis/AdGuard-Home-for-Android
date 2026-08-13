@@ -1,0 +1,38 @@
+# Android Studio and Gradle
+.gradle/
+.kotlin/
+**/build/
+local.properties
+.idea/
+*.iml
+
+# Build and release outputs
+dist/
+*.apk
+*.aab
+*.zip
+*.idsig
+
+# Signing material and local secrets
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+keystore.properties
+secrets.properties
+
+# Native build outputs
+*.o
+*.so
+
+# Logs, diagnostics, and editor files
+*.log
+*.pid
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+.vscode/
+

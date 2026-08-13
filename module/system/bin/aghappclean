@@ -1,0 +1,228 @@
+#!/system/bin/sh
+
+# Aggressive mode: remove complete application cache directories plus known
+# advertising resources while the module is active.  File locks are excluded.
+DATA_DIR=${AGH_DATA_DIR:-/data/adb/agh}
+PID_FILE=$DATA_DIR/appclean.pid
+PRIVATE_DNS_STATE=$DATA_DIR/private-dns.state
+IFW_DIR=/data/system/ifw
+
+log() {
+  mkdir -p "$DATA_DIR/logs" 2>/dev/null
+  echo "$(date '+%Y-%m-%d %H:%M:%S') appclean: $*" >> "$DATA_DIR/logs/appclean.log"
+}
+
+save_private_dns_state() {
+  [ -s "$PRIVATE_DNS_STATE" ] && return 0
+  mkdir -p "$DATA_DIR" || return 1
+  {
+    echo "mode=$(settings get global private_dns_mode 2>/dev/null)"
+    echo "specifier=$(settings get global private_dns_specifier 2>/dev/null)"
+  } > "$PRIVATE_DNS_STATE.tmp.$$" || return 1
+  chmod 600 "$PRIVATE_DNS_STATE.tmp.$$"
+  mv "$PRIVATE_DNS_STATE.tmp.$$" "$PRIVATE_DNS_STATE"
+  log "saved private DNS state"
+}
+
+restore_private_dns_state() {
+  local mode specifier
+  [ -s "$PRIVATE_DNS_STATE" ] || return 0
+  mode=$(sed -n 's/^mode=//p' "$PRIVATE_DNS_STATE" | head -n 1)
+  specifier=$(sed -n 's/^specifier=//p' "$PRIVATE_DNS_STATE" | head -n 1)
+  case "$mode" in ''|null) settings delete global private_dns_mode >/dev/null 2>&1 ;; *) settings put global private_dns_mode "$mode" >/dev/null 2>&1 || return 1 ;; esac
+  case "$specifier" in ''|null) settings delete global private_dns_specifier >/dev/null 2>&1 ;; *) settings put global private_dns_specifier "$specifier" >/dev/null 2>&1 || return 1 ;; esac
+  rm -f "$PRIVATE_DNS_STATE"
+  log "restored private DNS state"
+}
+
+stop_cleaner() {
+  if [ -s "$PID_FILE" ]; then
+    pid=$(cat "$PID_FILE" 2>/dev/null)
+    case "$pid" in
+      ''|*[!0-9]*) ;;
+      *) kill "$pid" 2>/dev/null ;;
+    esac
+  fi
+  rm -f "$PID_FILE"
+  restore_private_dns_state
+}
+
+request_refresh() {
+  if [ -s "$PID_FILE" ]; then
+    pid=$(cat "$PID_FILE" 2>/dev/null)
+    case "$pid" in
+      ''|*[!0-9]*) ;;
+      *) kill -USR1 "$pid" 2>/dev/null ;;
+    esac
+  fi
+}
+
+case "$1" in
+  --stop) stop_cleaner; exit 0 ;;
+  --refresh) request_refresh; exit 0 ;;
+esac
+
+if [ -s "$PID_FILE" ]; then
+  previous=$(cat "$PID_FILE" 2>/dev/null)
+  case "$previous" in
+    *[!0-9]*|'') ;;
+    *) kill -0 "$previous" 2>/dev/null && exit 0 ;;
+  esac
+fi
+
+mkdir -p "$DATA_DIR"
+echo $$ > "$PID_FILE"
+trap 'rm -f "$PID_FILE"; exit 0' HUP INT TERM EXIT
+
+targets() {
+  cat <<'EOF'
+/data/data/com.sankuai.meituan.takeoutnew/files/cips/common/waimai/assets/ad
+/data/media/0/Android/data/com.sankuai.meituan.takeoutnew/files/cips/common/waimai/assets/promotion
+/data/data/com.zhihu.android/files/ad
+/data/data/tv.danmaku.bili/files/splash2
+/data/data/tv.danmaku.bili/files/splash_top_view
+/data/data/tv.danmaku.bili/files/resmanager_resource_1
+/data/data/tv.danmaku.bili/files/resmanager_resource_2
+/data/data/tv.danmaku.bili/files/resmanager_resource_3
+/data/data/com.ai.obc.cbn.app/files/splashShow
+/data/media/0/Android/data/cn.kuwo.player/files/KuwoMusic/.screenad
+/data/media/0/Android/data/cn.kuwo.player/files/KuwoMusic/.ad
+/data/media/0/Android/data/cn.kuwo.kwmusichd/files/KwPlayerHD/.screenad
+/data/data/com.netease.cloudmusic/cache/Ad
+/data/data/cn.damai/files/ad_dir
+/data/data/com.sf.activity/files/openScreenADsImg
+/data/data/cn.missevan/cache/splash
+/data/data/com.xiaomi.mico/files/data_cache/journal
+/data/data/com.autonavi.minimap/files/LaunchDynamicResource
+/data/data/com.autonavi.minimap/files/splash
+/data/data/com.ss.android.ugc.aweme/files/im_common_resource/common_resource/scene_strategy/incentive_chat_group_panel_alpha_video_festival
+/data/media/0/Android/data/com.tencent.mobileqq/files/vas_ad
+/data/data/com.anjuke.android.app/cache/splash_ad
+/data/data/com.bankcomm.maidanba/files/imageCachePath
+/data/data/com.bankcomm.maidanba/files/tabAdsPath
+/data/data/com.xiaomi.smarthome/files/sh_ads_file
+/data/media/0/Android/data/com.mihoyo.hyperion/cache/splash
+/data/data/com.cn21.ecloud/files/ecloud_current_screenad.obj
+/data/data/com.taobao.idlefish/files/splash_ad_assets
+/data/data/com.taobao.idlefish/files/ad
+/data/data/com.taobao.idlefish/cache/beizi
+/data/data/com.umetrip.android.msky.app/files/ad
+/data/media/0/Android/data/ctrip.android.view/cache/CTADCache
+/data/data/ctrip.android.view/files/CTAD
+/data/media/0/Android/data/com.yipiao/files/CTADCache
+/data/data/com.yipiao/files/CTADSet
+/data/media/0/Android/data/com.jingdong.app.mall/cache/JDVideoFileDir
+/data/data/com.hexin.plat.android/cache/splash_images
+/data/data/com.ss.android.article.news/files/splashCache
+/data/data/com.apkpure.aegon/cache/splash
+/data/media/0/Android/data/com.kugou.android/files/kugou/.splash_v4
+/data/data/com.aabbc.cc/files/cn_jiguang_union_ads
+/data/media/0/Android/data/com.sankuai.movie/cache/maoyan_downlaod
+/data/media/0/Android/data/com.sankuai.movie/cache/cips/common/mtplatform_mtpicasso/assets/image_manager_disk_cache
+/data/data/com.tencent.tgclub/cache/image_manager_disk_cache
+/data/data/com.ganji.android.haoche_c/files/guazi_theme_image
+/data/media/0/Android/data/com.meituan.retail.v.android/cache/cips/common/mtplatform_mtpicasso/assets/image_manager_disk_cache
+/data/data/com.ecitic.bank.mobile/files/citic/advs
+/data/data/cn.jsb.china/cache/images
+/data/data/cn.jsb.china/files/jsbank/splash
+/data/data/com.sdu.didi.psnger/cache/image_manager_disk_cache
+/data/data/com.pmph.irenwei/files/ad.gif
+/data/media/0/Android/data/com.nanfangjijin.app/files/ad
+/data/data/com.ihandy.fund/cache/download/splash
+/data/media/0/Android/data/com.chinamobile.mcloud/files/boot_logo
+/data/data/com.ccb.zzb.activity/files/image
+/data/data/com.tencent.apps.valorant/cache/splash
+EOF
+}
+
+packages() {
+  cat <<'EOF'
+mark.via
+com.microsoft.emmx
+com.sankuai.meituan.takeoutnew
+com.zhihu.android
+tv.danmaku.bili
+com.ai.obc.cbn.app
+cn.kuwo.player
+cn.kuwo.kwmusichd
+com.netease.cloudmusic
+cn.damai
+com.sf.activity
+cn.missevan
+com.xiaomi.mico
+com.autonavi.minimap
+com.ss.android.ugc.aweme
+com.tencent.mobileqq
+com.anjuke.android.app
+com.bankcomm.maidanba
+com.xiaomi.smarthome
+com.mihoyo.hyperion
+com.cn21.ecloud
+com.taobao.idlefish
+com.umetrip.android.msky.app
+ctrip.android.view
+com.yipiao
+com.jingdong.app.mall
+com.hexin.plat.android
+com.ss.android.article.news
+com.apkpure.aegon
+com.kugou.android
+com.aabbc.cc
+com.sankuai.movie
+com.tencent.tgclub
+com.ganji.android.haoche_c
+com.meituan.retail.v.android
+com.ecitic.bank.mobile
+cn.jsb.china
+com.sdu.didi.psnger
+com.pmph.irenwei
+com.nanfangjijin.app
+com.ihandy.fund
+com.chinamobile.mcloud
+com.ccb.zzb.activity
+com.tencent.apps.valorant
+EOF
+}
+
+clear_app_caches() {
+  packages | while IFS= read -r package; do
+    [ -n "$package" ] || continue
+    rm -rf \
+      "/data/data/$package/cache" \
+      "/data/user/0/$package/cache" \
+      "/data/media/0/Android/data/$package/cache" 2>/dev/null
+  done
+}
+
+force_system_policy() {
+  save_private_dns_state || log "failed to save private DNS state"
+  [ "$(settings get global private_dns_mode 2>/dev/null)" = "off" ] || \
+    settings put global private_dns_mode off >/dev/null 2>&1
+  specifier=$(settings get global private_dns_specifier 2>/dev/null)
+  case "$specifier" in
+    ''|null) ;;
+    *) settings delete global private_dns_specifier >/dev/null 2>&1 ;;
+  esac
+  # The installer backed up IFW; keep it clear while filtering is active.
+  # uninstall.sh restores the saved pre-module state.
+  [ -d "$IFW_DIR" ] && rm -rf "$IFW_DIR"/* 2>/dev/null
+}
+
+cleanup_targets() {
+  targets | while IFS= read -r target; do
+    [ -e "$target" ] && rm -rf "$target" 2>/dev/null
+  done
+}
+
+trap 'clear_app_caches' USR1
+
+# A new boot or DNS takeover gets one immediate application-cache pass.
+clear_app_caches
+force_system_policy
+
+while :; do
+  sleep 60
+  cleanup_targets
+  clear_app_caches
+  force_system_policy
+done

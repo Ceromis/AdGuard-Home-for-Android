@@ -1,0 +1,1335 @@
+#!/system/bin/sh
+
+MODDIR=${AGH_MODDIR:-${0%/*}/../..}
+DATA_DIR=${AGH_DATA_DIR:-/data/adb/agh}
+CONFIG=$DATA_DIR/AdGuardHome.yaml
+AGH_BIN=$MODDIR/system/bin/AdGuardHome
+PID_FILE=$DATA_DIR/agh.pid
+LAUNCH_FILE=$DATA_DIR/agh.launch
+DISABLED_FILE=$DATA_DIR/disabled
+RESOLVER_STATE=$DATA_DIR/resolver.state
+RESOLVER_BLOCKED=$DATA_DIR/resolver.blocked
+RESOLVER_HEALTH=$DATA_DIR/resolver.health
+RESOLVER_LOG=$DATA_DIR/logs/resolver.log
+DNS_HELPER_APK=
+APP_PROCESS=
+LOG_FILE=$DATA_DIR/logs/AdGuardHome.log
+CONTROL_LOCK=$DATA_DIR/control.lock
+CA_BUNDLE=$DATA_DIR/cacerts.pem
+IPTABLES=$(command -v iptables)
+IP6TABLES=$(command -v ip6tables)
+PROXY_CTL=$MODDIR/system/bin/aghproxy
+APP_CLEANER=$MODDIR/system/bin/aghappclean
+SEED_FILTER_DIR=$MODDIR/seed/filters
+FILTER_CACHE_DIR=$DATA_DIR/work/data/filters
+BROWSER_RESET_STATE=$DATA_DIR/browser-reset.boot
+NETWORK_ALERT=$DATA_DIR/network-alert
+
+log() {
+  mkdir -p "${LOG_FILE%/*}" 2>/dev/null
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
+}
+
+acquire_control_lock() {
+  local waited=0 owner
+  mkdir -p "$DATA_DIR" 2>/dev/null || return 1
+  while ! mkdir "$CONTROL_LOCK" 2>/dev/null; do
+    owner=$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$CONTROL_LOCK/owner" 2>/dev/null | head -n 1)
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$CONTROL_LOCK" 2>/dev/null
+      continue
+    fi
+    [ "$waited" -ge 15 ] && { log "control action busy; refusing overlapping operation: $1"; return 75; }
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "pid=$$ action=$1" > "$CONTROL_LOCK/owner"
+  trap 'rm -rf "$CONTROL_LOCK" 2>/dev/null' EXIT HUP INT TERM
+  return 0
+}
+
+seed_filter_cache() {
+  local filter_id source target copied=1
+  [ -d "$SEED_FILTER_DIR" ] || return 1
+  mkdir -p "$FILTER_CACHE_DIR" || return 1
+  for filter_id in 1721861844 1721861846 1735560833 1735560834; do
+    source=$SEED_FILTER_DIR/$filter_id.txt
+    target=$FILTER_CACHE_DIR/$filter_id.txt
+    [ -s "$source" ] || continue
+    if [ ! -s "$target" ]; then
+      cp "$source" "$target" || continue
+      chmod 600 "$target"
+      copied=0
+      log "seeded offline filter cache: $filter_id"
+    fi
+  done
+  return "$copied"
+}
+
+factory_rules() {
+  local backup=$DATA_DIR/factory-user-rules.txt
+  [ -s "$backup" ] || { echo factory-rules-backup-missing; return 1; }
+  cat "$backup"
+}
+
+capture_network_failsafe_state() {
+  local target=$DATA_DIR/logs/network-failsafe-state.log
+  local temp=$target.tmp.$$
+  mkdir -p "$DATA_DIR/logs" || return 1
+  {
+    echo "===== AdGuard Home network failsafe snapshot ====="
+    echo "timestamp=$(date '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null)"
+    echo "boot_id=$(current_boot_id)"
+    echo "uid=$(id 2>/dev/null)"
+    echo "===== connectivity ====="
+    dumpsys connectivity 2>&1 || true
+    echo "===== netd / dns resolver ====="
+    dumpsys netd 2>&1 || true
+    echo "===== route ====="
+    ip route 2>&1 || true
+    ip -6 route 2>&1 || true
+    echo "===== interfaces ====="
+    ip addr 2>&1 || true
+    echo "===== firewall ====="
+    "$IPTABLES" -S 2>&1 || true
+    "$IP6TABLES" -S 2>&1 || true
+    echo "===== system network settings ====="
+    settings get global private_dns_mode 2>&1 || true
+    settings get global private_dns_specifier 2>&1 || true
+    settings get global http_proxy 2>&1 || true
+    settings get global global_http_proxy_host 2>&1 || true
+    settings get global global_http_proxy_port 2>&1 || true
+    echo "===== processes ====="
+    ps -A 2>&1 || true
+    echo "===== module control status ====="
+    "$0" status 2>&1 || true
+    "$PROXY_CTL" status 2>&1 || true
+    echo "===== resolver state files ====="
+    for file in "$RESOLVER_STATE" "$RESOLVER_BLOCKED" "$RESOLVER_HEALTH" "$DATA_DIR/disabled" "$DATA_DIR/agh.pid" "$DATA_DIR/agh.launch"; do
+      echo "--- $file"
+      if [ -f "$file" ]; then cat "$file" 2>&1; else echo "<missing>"; fi
+    done
+    echo "===== recent module logs ====="
+    for file in "$DATA_DIR/logs"/*.log; do
+      [ "$file" = "$target" ] && continue
+      [ -f "$file" ] || continue
+      echo "--- $file"
+      tail -n 200 "$file" 2>&1 || true
+    done
+  } > "$temp" 2>&1 || { rm -f "$temp"; return 1; }
+  chmod 600 "$temp" 2>/dev/null || :
+  mv "$temp" "$target"
+}
+
+network_failsafe() {
+  capture_network_failsafe_state || log "failed to capture complete network failsafe snapshot"
+  if stop; then
+    {
+      echo "当前网络状态异常，可能是我们的过滤问题，我们已经先行退出了。"
+      echo "问题反馈请在管理器关于页面加入交流群联系开发者。"
+    } > "$NETWORK_ALERT.tmp" || return 1
+    chmod 600 "$NETWORK_ALERT.tmp" 2>/dev/null
+    mv "$NETWORK_ALERT.tmp" "$NETWORK_ALERT" || return 1
+    log "Android reported an unvalidated connected network; filtering was stopped and system networking restored"
+    echo network-failsafe-active
+    return 0
+  fi
+  log "network failsafe could not stop filtering because system DNS restoration failed"
+  echo network-failsafe-restore-failed
+  return 1
+}
+
+network_alert() {
+  [ -s "$NETWORK_ALERT" ] && cat "$NETWORK_ALERT"
+}
+
+network_alert_ack() {
+  rm -f "$NETWORK_ALERT"
+  echo network-alert-acknowledged
+}
+
+active_physical_network_state() {
+  local snapshot=/dev/.agh-network-watch.$$ netid block transport validated portal
+  dumpsys connectivity > "$snapshot" 2>/dev/null || { rm -f "$snapshot"; return 1; }
+  netid=$(sed -n 's/^[[:space:]]*Active default network:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' "$snapshot" | head -n 1)
+  case "$netid" in ''|*[!0-9]*) rm -f "$snapshot"; return 1 ;; esac
+  block=$(active_network_block "$snapshot" "$netid")
+  rm -f "$snapshot"
+  printf '%s\n' "$block" | grep -qE 'WIFI|TRANSPORT_WIFI' && transport=wifi
+  [ -n "$transport" ] || { printf '%s\n' "$block" | grep -qE 'CELLULAR|TRANSPORT_CELLULAR' && transport=cellular; }
+  [ -n "$transport" ] || return 1
+  printf '%s\n' "$block" | grep -qE 'IS_VALIDATED|&VALIDATED([& ]|$)' && validated=1 || validated=0
+  printf '%s\n' "$block" | grep -qE 'IS_CAPTIVE_PORTAL|CAPTIVE_PORTAL|PARTIAL_CONNECTIVITY' && portal=1 || portal=0
+  echo "$netid $transport $validated $portal"
+}
+
+network_watch() {
+  local state netid transport validated portal now failure_id= failure_since=0 elapsed
+  trap 'exit 0' HUP INT TERM
+  while :; do
+    if [ -f "$DISABLED_FILE" ] || ! is_running; then
+      failure_id= failure_since=0
+    else
+      state=$(active_physical_network_state) || state=
+      if [ -z "$state" ]; then
+        failure_id= failure_since=0
+      else
+        set -- $state
+        netid=$1 transport=$2 validated=$3 portal=$4
+        if [ "$validated" = 1 ] || [ "$portal" = 1 ]; then
+          [ "$portal" = 1 ] && log "skipping network failsafe for captive portal or partial-connectivity network netId=$netid"
+          failure_id= failure_since=0
+        else
+          now=$(date +%s)
+          case "$now" in ''|*[!0-9]*) now=0 ;; esac
+          if [ "$failure_id" != "$netid" ] || [ "$failure_since" -le 0 ]; then
+            failure_id=$netid
+            failure_since=$now
+          fi
+          elapsed=$((now - failure_since))
+          log "unvalidated $transport network netId=$netid duration=${elapsed}s/10s"
+          if [ "$elapsed" -ge 10 ]; then
+            if network_failsafe; then
+              am start -W -a android.intent.action.VIEW -n com.adguardhome.android/.ManagerActivity \
+                --ez network_failsafe true >/dev/null 2>&1 || log "Android blocked the network alert activity launch"
+            fi
+            failure_id= failure_since=0
+          fi
+        fi
+      fi
+    fi
+    sleep 5
+  done
+}
+
+# Android keeps DNS servers per network in netd.  iptables cannot see IPv6
+# resolver traffic on devices whose kernels do not expose an IPv6 nat table,
+# so use the tiny Java helper bundled in the module.  The installed companion
+# APK remains a fallback for source-tree testing and older module packages.
+resolver_helper() {
+  local apk bundled=$MODDIR/system/etc/agh-dns-helper.apk
+  if [ -n "$DNS_HELPER_APK" ] && [ -f "$DNS_HELPER_APK" ] && [ -n "$APP_PROCESS" ]; then
+    return 0
+  fi
+  if [ -f "$bundled" ]; then
+    apk=$bundled
+  else
+    apk=$(pm path com.adguardhome.android 2>/dev/null | sed -n 's/^package://p' | head -n 1)
+  fi
+  [ -n "$apk" ] && [ -f "$apk" ] || return 1
+  if [ -x /system/bin/app_process64 ]; then
+    APP_PROCESS=/system/bin/app_process64
+  elif [ -x /system/bin/app_process ]; then
+    APP_PROCESS=/system/bin/app_process
+  else
+    return 1
+  fi
+  DNS_HELPER_APK=$apk
+  return 0
+}
+
+resolver_call() {
+  local netid=$1
+  shift
+  [ -n "$netid" ] && [ "$#" -gt 0 ] || return 1
+  resolver_helper || return 1
+  mkdir -p "${RESOLVER_LOG%/*}" 2>/dev/null
+  CLASSPATH="$DNS_HELPER_APK" "$APP_PROCESS" /system/bin \
+    com.adguardhome.android.DnsSetter "$netid" "$@" >> "$RESOLVER_LOG" 2>&1
+}
+
+connectivity_snapshot() {
+  local target=$1
+  [ -n "$target" ] || return 1
+  if [ -n "$AGH_CONNECTIVITY_SNAPSHOT" ] && [ -r "$AGH_CONNECTIVITY_SNAPSHOT" ]; then
+    cp "$AGH_CONNECTIVITY_SNAPSHOT" "$target" && [ -s "$target" ]
+    return
+  fi
+  dumpsys connectivity > "$target" 2>/dev/null && [ -s "$target" ]
+}
+
+active_network_id() {
+  local source=$1
+  local netid
+  [ -r "$source" ] || return 1
+  # ConnectivityService may report a VPN's underlying Wi-Fi/mobile network as
+  # the default. DNSResolver is scoped by netId, so prefer a validated VPN
+  # that covers the full app UID range before falling back to the default.
+  netid=$(awk '
+    function emit() {
+      if (id != "" && vpn && validated && all_uids) {
+        print id
+        exit
+      }
+    }
+    /NetworkAgentInfo\{network\{/ {
+      emit()
+      id = $0
+      sub(/^.*NetworkAgentInfo\{network\{/, "", id)
+      sub(/\}.*/, "", id)
+      vpn = validated = all_uids = 0
+    }
+    /VPN CONNECTED|IS_VPN|Transports: VPN/ { vpn = 1 }
+    /IS_VALIDATED|&VALIDATED([& ]|$)/ { validated = 1 }
+    /Uids: <\{0-99999\}>|Uids: <\{0-99999\},/ { all_uids = 1 }
+    END { emit() }
+  ' "$source" | head -n 1)
+  case "$netid" in
+    [0-9]*) echo "$netid"; return 0 ;;
+  esac
+  netid=$(sed -n 's/^[[:space:]]*Active default network:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' "$source" | head -n 1)
+  case "$netid" in
+    [0-9]*) echo "$netid"; return 0 ;;
+  esac
+  # Older Android releases may omit the summary line.  Fall back to the
+  # validated primary transport, then to the first Wi-Fi/cellular network.
+  awk '
+    function id(line, value) {
+      value = line
+      sub(/^.*NetworkAgentInfo\{network\{/, "", value)
+      sub(/\}.*/, "", value)
+      return value
+    }
+    index($0, "NetworkAgentInfo{network{") {
+      if (index($0, "TRANSPORT_PRIMARY") && index($0, "IS_VALIDATED")) {
+        print id($0)
+        found = 1
+        exit
+      }
+      if (fallback == "" && (index($0, "WIFI") || index($0, "CELLULAR"))) fallback = id($0)
+    }
+    END { if (!found && fallback != "") print fallback }
+  ' "$source" | head -n 1
+}
+
+active_network_block() {
+  local source=$1
+  local netid=$2
+  [ -r "$source" ] && [ -n "$netid" ] || return 1
+  awk -v needle="NetworkAgentInfo{network{$netid}" '
+    index($0, "NetworkAgentInfo{network{") {
+      if (capture) exit
+      if (index($0, needle)) capture = 1
+    }
+    capture { print }
+  ' "$source"
+}
+
+active_network_values() {
+  local source=$1
+  local netid=$2
+  active_network_block "$source" "$netid" \
+    | sed -n 's/.*DnsAddresses:[[:space:]]*\[\([^]]*\)\].*/\1/p'
+}
+
+active_network_servers() {
+  local source=$1
+  local netid=$2
+  local values normalized
+  values=$(active_network_values "$source" "$netid")
+  normalized=$(printf '%s\n' "$values" | tr ',' '\n' | sed 's/^[[:space:]]*//; s#^/##; s/[[:space:]]*$//; /^[[:space:]]*$/d')
+  [ -n "$normalized" ] && printf '%s\n' "$normalized"
+  # Old builds may already have replaced the list with loopback.  The DHCP
+  # server is a conservative emergency resolver for restoring that state.
+  if [ -z "$normalized" ] || ! printf '%s\n' "$normalized" | grep -qvE '^(127\.0\.0\.1|::1|0\.0\.0\.0|::)$'; then
+    active_network_block "$source" "$netid" \
+      | sed -n 's/.*ServerAddress:[[:space:]]*\/\([^ ,}]*\).*/\1/p'
+  fi
+}
+
+active_network_uses_loopback() {
+  local source=$1
+  local netid=$2
+  active_network_values "$source" "$netid" \
+    | tr ',' '\n' \
+    | sed 's/^[[:space:]]*//; s#^/##; s/[[:space:]]*$//' \
+    | grep -qE '^(127\.0\.0\.1|::1)$'
+}
+
+is_usable_dns() {
+  case "$1" in
+    ''|127.0.0.0|127.0.0.1|127.*|::|::1|0.0.0.0) return 1 ;;
+  esac
+  return 0
+}
+
+current_boot_id() {
+  cat /proc/sys/kernel/random/boot_id 2>/dev/null
+}
+
+state_boot_id() {
+  sed -n 's/^boot_id=//p' "$RESOLVER_STATE" 2>/dev/null | head -n 1
+}
+
+state_network_id() {
+  sed -n 's/^netid=//p' "$RESOLVER_STATE" 2>/dev/null | head -n 1
+}
+
+state_active() {
+  sed -n 's/^active=//p' "$RESOLVER_STATE" 2>/dev/null | tail -n 1
+}
+
+resolver_blocked_for() {
+  local netid=$1
+  local boot
+  [ -s "$RESOLVER_BLOCKED" ] || return 1
+  boot=$(current_boot_id)
+  grep -qx "boot_id=$boot" "$RESOLVER_BLOCKED" 2>/dev/null &&
+    grep -qx "netid=$netid" "$RESOLVER_BLOCKED" 2>/dev/null
+}
+
+resolver_mark_blocked() {
+  local netid=$1
+  local temp=$RESOLVER_BLOCKED.tmp.$$
+  {
+    echo "boot_id=$(current_boot_id)"
+    echo "netid=$netid"
+  } > "$temp" || return 1
+  chmod 600 "$temp"
+  mv "$temp" "$RESOLVER_BLOCKED"
+}
+
+resolver_snapshot() {
+  local source=$1
+  local netid=$2
+  local server count=0 temp
+  [ -r "$source" ] && [ -n "$netid" ] || return 1
+  temp=$RESOLVER_STATE.tmp.$$
+  rm -f "$temp"
+  {
+    echo "version=2"
+    echo "boot_id=$(current_boot_id)"
+    echo "netid=$netid"
+    echo "active=0"
+    for server in $(active_network_servers "$source" "$netid"); do
+      if is_usable_dns "$server"; then
+        echo "dns=$server"
+        count=$((count + 1))
+      fi
+    done
+  } > "$temp" || return 1
+  if [ "$count" -eq 0 ]; then
+    rm -f "$temp"
+    log "no usable system DNS found for netid=$netid; resolver takeover skipped"
+    return 1
+  fi
+  chmod 600 "$temp"
+  mv "$temp" "$RESOLVER_STATE"
+  log "saved system DNS for netid=$netid ($count server(s))"
+  return 0
+}
+
+resolver_mark_active() {
+  local temp=$RESOLVER_STATE.tmp.$$
+  [ -s "$RESOLVER_STATE" ] || return 1
+  awk '
+    /^active=/ && !done { print "active=1"; done=1; next }
+    { print }
+    END { if (!done) print "active=1" }
+  ' "$RESOLVER_STATE" > "$temp" || return 1
+  chmod 600 "$temp"
+  mv "$temp" "$RESOLVER_STATE"
+}
+
+resolver_health_recent() {
+  local netid=$1 now checked age
+  [ -s "$RESOLVER_HEALTH" ] || return 1
+  grep -qx "boot_id=$(current_boot_id)" "$RESOLVER_HEALTH" 2>/dev/null || return 1
+  grep -qx "netid=$netid" "$RESOLVER_HEALTH" 2>/dev/null || return 1
+  checked=$(sed -n 's/^checked_at=//p' "$RESOLVER_HEALTH" 2>/dev/null | head -n 1)
+  now=$(date +%s 2>/dev/null)
+  [ -n "$checked" ] && [ -n "$now" ] || return 1
+  case "$checked:$now" in *[!0-9:]*) return 1 ;; esac
+  age=$((now - checked))
+  [ "$age" -ge 0 ] && [ "$age" -lt 300 ]
+}
+
+resolver_mark_healthy() {
+  local netid=$1 temp=$RESOLVER_HEALTH.tmp.$$
+  {
+    echo "boot_id=$(current_boot_id)"
+    echo "netid=$netid"
+    echo "checked_at=$(date +%s 2>/dev/null)"
+  } > "$temp" || return 1
+  chmod 600 "$temp"
+  mv "$temp" "$RESOLVER_HEALTH"
+}
+
+local_dns_ready() {
+  is_running || return 1
+  ss -ln 2>/dev/null | grep -qE '(^|[[:space:]])127\.0\.0\.1:5353([[:space:]]|$)'
+}
+
+dns_probe_host() {
+  local host=$1
+  local output first
+  if command -v timeout >/dev/null 2>&1; then
+    output=$(timeout 5 ping -c 1 -W 2 "$host" 2>&1)
+  else
+    output=$(ping -c 1 -W 2 "$host" 2>&1)
+  fi
+  first=$(printf '%s\n' "$output" | head -n 1)
+  case "$first" in
+    PING*"("*")"*) return 0 ;;
+  esac
+  log "system DNS probe failed for $host: $first"
+  return 1
+}
+
+dns_probe_blocked() {
+  local host=$1
+  local output first
+  if command -v timeout >/dev/null 2>&1; then
+    output=$(timeout 5 ping -c 1 -W 2 "$host" 2>&1)
+  else
+    output=$(ping -c 1 -W 2 "$host" 2>&1)
+  fi
+  first=$(printf '%s\n' "$output" | head -n 1)
+  case "$first" in
+    PING*"("*")"*)
+      log "DNS filtering probe unexpectedly resolved $host: $first"
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+resolver_filtering_healthy() {
+  local slot host
+  slot=$(date +%s 2>/dev/null)
+  case "$slot" in ''|*[!0-9]*) slot=0 ;; esac
+  slot=$((slot / 10 % 4))
+  case "$slot" in
+    0) host=googleads.g.doubleclick.net ;;
+    1) host=adservice.google.com ;;
+    2) host=securepubads.g.doubleclick.net ;;
+    *) host=pagead2.googlesyndication.com ;;
+  esac
+  # A failed resolver also makes blocked hosts unresolvable.  Prove that the
+  # ordinary DNS path works before treating an unresolved ad host as filtering.
+  dns_probe_host example.com &&
+    dns_probe_host www.iana.org &&
+    dns_probe_blocked "$host"
+}
+
+system_dns_probe() {
+  # Connectivity alone is not proof that Android accepted localhost: netd can
+  # silently retain or restore the network DNS.  Require ordinary names to
+  # resolve and known, publicly resolvable ad names to be blocked by AGH.
+  dns_probe_host example.com &&
+    dns_probe_host www.iana.org &&
+    dns_probe_blocked googleads.g.doubleclick.net &&
+    dns_probe_blocked adservice.google.com
+}
+
+resolver_restore() {
+  local netid servers
+  if [ -s "$RESOLVER_STATE" ] && [ "$(state_active)" = "1" ]; then
+    netid=$(state_network_id)
+    servers=$(sed -n 's/^dns=//p' "$RESOLVER_STATE")
+    if [ -n "$netid" ] && [ -n "$servers" ]; then
+      resolver_call "$netid" $servers || return 1
+      # Android may keep negative answers and the old resolver socket alive
+      # after IDnsResolver is restored.  Flush both framework and netd caches
+      # before reporting recovery complete.
+      ndc resolver flushnet "$netid" >/dev/null 2>&1 || :
+      cmd netd resolver clearnetdns "$netid" >/dev/null 2>&1 || :
+      am broadcast -a android.intent.action.CLEAR_DNS_CACHE >/dev/null 2>&1 || :
+      sleep 1
+    fi
+  fi
+  rm -f "$RESOLVER_STATE" "$RESOLVER_BLOCKED" "$RESOLVER_HEALTH"
+  return 0
+}
+
+verify_restored_dns() {
+  dns_probe_host example.com || dns_probe_host www.baidu.com
+}
+
+network_is_wifi() {
+  local snapshot=${1:-/dev/.agh-connectivity-check.$$}
+  local netid block
+  connectivity_snapshot "$snapshot" || return 1
+  netid=$(active_network_id "$snapshot") || { rm -f "$snapshot"; return 1; }
+  block=$(active_network_block "$snapshot" "$netid")
+  printf '%s\n' "$block" | grep -qE 'WIFI|TRANSPORT_WIFI'
+  local result=$?
+  rm -f "$snapshot"
+  return "$result"
+}
+
+resolver_takeover() {
+  local snapshot=${AGH_CONNECTIVITY_TEMP:-/dev/.agh-connectivity.$$}
+  local netid saved boot saved_boot
+  connectivity_snapshot "$snapshot" || {
+    rm -f "$snapshot"
+    return 2
+  }
+  netid=$(active_network_id "$snapshot")
+  case "$netid" in
+    ''|*[!0-9]*) rm -f "$snapshot"; return 2 ;;
+  esac
+  local_dns_ready || {
+    rm -f "$snapshot"
+    log "local DNS is not listening; resolver takeover skipped"
+    return 1
+  }
+  if [ -s "$RESOLVER_STATE" ]; then
+    boot=$(current_boot_id)
+    saved_boot=$(state_boot_id)
+    if [ -z "$saved_boot" ] || { [ -n "$boot" ] && [ "$saved_boot" != "$boot" ]; }; then
+      rm -f "$RESOLVER_STATE"
+      log "discarded incomplete or stale resolver state before takeover"
+    fi
+  fi
+  saved=$(state_network_id)
+  if [ -s "$RESOLVER_STATE" ] && [ "$saved" != "$netid" ]; then
+    # netd normally removes the old network together with its resolver state.
+    # A restore may therefore fail after switching Wi-Fi/mobile data; do not
+    # let a dead netId permanently prevent takeover of the new active network.
+    resolver_restore || {
+      log "discarded resolver state for inactive netid=$saved"
+      rm -f "$RESOLVER_STATE"
+    }
+  elif [ -s "$RESOLVER_STATE" ]; then
+    # LinkProperties intentionally continues to show DHCP DNS even after an
+    # IDnsResolver override.  Older builds mistook that for takeover loss and
+    # restored the router DNS on every sync, creating a recurring leak window.
+    # Keep the saved original servers and re-assert localhost in place.
+    if [ "$(state_active)" = "1" ]; then
+      if resolver_health_recent "$netid"; then
+        rm -f "$snapshot"
+        return 0
+      fi
+      if resolver_filtering_healthy; then
+        resolver_mark_healthy "$netid" >/dev/null 2>&1 || :
+        rm -f "$snapshot"
+        return 0
+      fi
+    fi
+    log "system resolver filtering path was lost; reasserting localhost for netid=$netid"
+  fi
+  if [ ! -s "$RESOLVER_STATE" ]; then
+    resolver_snapshot "$snapshot" "$netid" || {
+      rm -f "$snapshot"
+      return 1
+    }
+  fi
+  rm -f "$snapshot"
+  # Some Android DNSResolver builds accept ::1 but fail all subsequent
+  # validation probes, then silently fall back to the network's IPv6 DNS.
+  # IPv4 loopback is supported consistently and still reaches the dual-stack
+  # AdGuard Home listener.
+  if ! resolver_call "$netid" 127.0.0.1; then
+    log "DNSResolver takeover failed for netid=$netid"
+    if resolver_restore; then
+      resolver_mark_blocked "$netid"
+    fi
+    return 1
+  fi
+  sleep 1
+  if system_dns_probe; then
+    resolver_mark_active || {
+      resolver_restore
+      return 1
+    }
+    rm -f "$RESOLVER_BLOCKED"
+    resolver_mark_healthy "$netid" >/dev/null 2>&1 || :
+    log "DNSResolver netid=$netid -> 127.0.0.1 (verified)"
+    return 0
+  fi
+  log "DNSResolver takeover broke system DNS for netid=$netid; rolling back"
+  remove_iptables_rules
+  if resolver_restore; then
+    resolver_mark_blocked "$netid"
+  else
+    log "critical: resolver rollback failed for netid=$netid; state retained"
+  fi
+  return 1
+}
+
+resolver_sync() {
+  is_running || return 1
+  # The active network may change from Wi-Fi/mobile data to a VPN.  Restoring
+  # the resolver here silently removes the previous takeover and leaves that
+  # new network free to use its own DNS.  Re-assert and verify localhost on
+  # every sync instead, so a VPN's virtual DNS endpoint cannot become a leak
+  # path between configuration refreshes.
+  resolver_takeover
+}
+
+proxy_control() {
+  [ -x "$PROXY_CTL" ] || return 0
+  "$PROXY_CTL" "$@"
+}
+
+hotspot_active() {
+  # Xiaomi creates wlan2 for the SoftAP; other Android builds use softap0 or
+  # ap_br_* names.  Do not mutate resolver or firewall state while tethering
+  # is bringing the interface up or serving clients.
+  local iface
+  for iface in wlan1 wlan2 wlan3 softap0 softap1 ap_br_wlan0 ap_br_wlan1 ap_br_wlan2; do
+    [ -d "/sys/class/net/$iface" ] || continue
+    case "$iface" in
+      wlan1|wlan2|wlan3)
+        [ "$iface" = "wlan0" ] || return 0
+        ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+start_app_cleaner() {
+  local pid
+  [ -x "$APP_CLEANER" ] || return 0
+  if [ -s "$DATA_DIR/appclean.pid" ]; then
+    pid=$(cat "$DATA_DIR/appclean.pid" 2>/dev/null)
+    case "$pid" in
+      ''|*[!0-9]*) ;;
+      *)
+        if kill -0 "$pid" 2>/dev/null; then
+          kill -USR1 "$pid" 2>/dev/null
+          return 0
+        fi
+        ;;
+    esac
+  fi
+  "$APP_CLEANER" >> "$DATA_DIR/logs/appclean.log" 2>&1 &
+}
+
+stop_app_cleaner() {
+  [ -x "$APP_CLEANER" ] || return 0
+  "$APP_CLEANER" --stop >/dev/null 2>&1
+}
+
+reset_browser_network_state() {
+  local boot package
+  boot=$(current_boot_id)
+  [ -n "$boot" ] || return 1
+  [ "$(cat "$BROWSER_RESET_STATE" 2>/dev/null)" = "$boot" ] && return 0
+  for package in mark.via com.microsoft.emmx; do
+    am force-stop "$package" >/dev/null 2>&1
+    rm -rf \
+      "/data/data/$package/cache" \
+      "/data/user/0/$package/cache" \
+      "/data/media/0/Android/data/$package/cache" 2>/dev/null
+  done
+  echo "$boot" > "$BROWSER_RESET_STATE"
+  chmod 600 "$BROWSER_RESET_STATE"
+  log "browser network caches reset after DNS takeover"
+}
+
+sync_all() {
+  local resolver_result=0
+  sync_ipv6_dns_fallback || log "IPv6 DNS fallback synchronization failed"
+  proxy_control sync >/dev/null 2>&1 || log "proxy compatibility sync failed"
+  resolver_sync || resolver_result=$?
+  start_app_cleaner
+  return "$resolver_result"
+}
+
+build_ca_bundle() {
+  local temp=$CA_BUNDLE.tmp
+  local cert_dir
+  local cert
+  local count
+  rm -f "$temp"
+
+  # Go does not discover Android's Conscrypt trust store on every ROM.  Build
+  # one regular PEM file and expose it only to the AdGuard Home process.
+  for cert_dir in /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts /apex/com.android.conscrypt/etc/security/cacerts; do
+    [ -d "$cert_dir" ] || continue
+    : > "$temp" || return 1
+    count=0
+    for cert in "$cert_dir"/*; do
+      [ -f "$cert" ] || continue
+      grep -q '^-----BEGIN CERTIFICATE-----' "$cert" 2>/dev/null || continue
+      grep -q '^-----END CERTIFICATE-----' "$cert" 2>/dev/null || continue
+      cat "$cert" >> "$temp" || return 1
+      echo >> "$temp"
+      count=$((count + 1))
+    done
+    [ "$count" -gt 0 ] && break
+  done
+
+  if [ ! -s "$temp" ] || [ "${count:-0}" -eq 0 ]; then
+    rm -f "$temp"
+    return 1
+  fi
+  chmod 600 "$temp"
+  mv "$temp" "$CA_BUNDLE"
+  log "loaded $count Android system CA certificates"
+}
+
+table_available() {
+  local tool=$1
+  local table=$2
+  [ -n "$tool" ] || return 1
+  "$tool" -w 2 -t "$table" -L >/dev/null 2>&1
+}
+
+delete_output_jump() {
+  local tool=$1
+  local table=$2
+  local chain=$3
+  local proto
+  [ -n "$tool" ] || return 0
+  for proto in udp tcp; do
+    # Android's legacy backend serializes these rules with an explicit
+    # protocol matcher.  Try both spellings so upgrades remain removable.
+    while "$tool" -w 2 -t "$table" -D OUTPUT -p "$proto" -m "$proto" --dport 53 -j "$chain" 2>/dev/null; do :; done
+    while "$tool" -w 2 -t "$table" -D OUTPUT -p "$proto" --dport 53 -j "$chain" 2>/dev/null; do :; done
+  done
+}
+
+remove_legacy_redirects() {
+  local tool=$1
+  local proto
+  [ -n "$tool" ] || return 0
+  for proto in udp tcp; do
+    while "$tool" -w 2 -t nat -D OUTPUT -p "$proto" -m "$proto" --dport 53 -m owner ! --uid-owner 0 -j REDIRECT --to-ports 53 2>/dev/null; do :; done
+    while "$tool" -w 2 -t nat -D OUTPUT -p "$proto" --dport 53 -m owner ! --uid-owner 0 -j REDIRECT --to-ports 53 2>/dev/null; do :; done
+  done
+}
+
+setup_chain() {
+  local tool=$1
+  local chain=$2
+  shift 2
+  [ -n "$tool" ] || return 1
+  table_available "$tool" nat || return 1
+  remove_legacy_redirects "$tool"
+  "$tool" -w 2 -t nat -N "$chain" 2>/dev/null || "$tool" -w 2 -t nat -L "$chain" >/dev/null 2>&1 || return 1
+  "$tool" -w 2 -t nat -F "$chain" 2>/dev/null || return 1
+  for address in "$@"; do
+    "$tool" -w 2 -t nat -A "$chain" -d "$address" -j RETURN 2>/dev/null || return 1
+  done
+  # Keep port 53 free for Android's hotspot DNS forwarder.  Redirect every
+  # local OUTPUT DNS request, including netd's system-UID queries, to the
+  # dedicated non-conflicting AdGuard Home port.  Android hotspot forwarding
+  # is handled on tethering interfaces and does not require IDnsResolver writes.
+  "$tool" -w 2 -t nat -A "$chain" -p udp -m udp --dport 53 -j REDIRECT --to-ports 5353 2>/dev/null || return 1
+  "$tool" -w 2 -t nat -A "$chain" -p tcp -m tcp --dport 53 -j REDIRECT --to-ports 5353 2>/dev/null || return 1
+  "$tool" -w 2 -t nat -C OUTPUT -p udp -m udp --dport 53 -j "$chain" 2>/dev/null ||
+    "$tool" -w 2 -t nat -I OUTPUT 1 -p udp -m udp --dport 53 -j "$chain" 2>/dev/null || return 1
+  "$tool" -w 2 -t nat -C OUTPUT -p tcp -m tcp --dport 53 -j "$chain" 2>/dev/null ||
+    "$tool" -w 2 -t nat -I OUTPUT 1 -p tcp -m tcp --dport 53 -j "$chain" 2>/dev/null || return 1
+}
+
+remove_chain() {
+  local tool=$1
+  local table=$2
+  local chain=$3
+  [ -n "$tool" ] || return 0
+  table_available "$tool" "$table" || return 0
+  delete_output_jump "$tool" "$table" "$chain"
+  "$tool" -w 2 -t "$table" -F "$chain" 2>/dev/null
+  "$tool" -w 2 -t "$table" -X "$chain" 2>/dev/null
+}
+
+remove_encrypted_dns_guard() {
+  local tool=$1 proto port
+  [ -n "$tool" ] || return 0
+  table_available "$tool" filter || return 0
+  for proto in udp tcp; do
+    for port in 853 784 8853; do
+      while "$tool" -w 2 -t filter -D OUTPUT -p "$proto" -m "$proto" --dport "$port" -j AGH_DNS_BYPASS 2>/dev/null; do :; done
+      while "$tool" -w 2 -t filter -D OUTPUT -p "$proto" --dport "$port" -j AGH_DNS_BYPASS 2>/dev/null; do :; done
+    done
+  done
+  "$tool" -w 2 -t filter -F AGH_DNS_BYPASS 2>/dev/null
+  "$tool" -w 2 -t filter -X AGH_DNS_BYPASS 2>/dev/null
+}
+
+setup_encrypted_dns_guard() {
+  local tool=$1 proto port
+  [ -n "$tool" ] || return 1
+  table_available "$tool" filter || return 1
+  remove_encrypted_dns_guard "$tool"
+  "$tool" -w 2 -t filter -N AGH_DNS_BYPASS 2>/dev/null || return 1
+  # Root-owned module traffic remains unrestricted.  Apps must fall back from
+  # DoT/DoQ to Android's resolver, where AdGuard Home can apply local rules.
+  "$tool" -w 2 -t filter -A AGH_DNS_BYPASS -m owner --uid-owner 0 -j RETURN 2>/dev/null || {
+    remove_encrypted_dns_guard "$tool"; return 1;
+  }
+  "$tool" -w 2 -t filter -A AGH_DNS_BYPASS -p tcp -j REJECT --reject-with tcp-reset 2>/dev/null ||
+    "$tool" -w 2 -t filter -A AGH_DNS_BYPASS -p tcp -j DROP 2>/dev/null || {
+      remove_encrypted_dns_guard "$tool"; return 1;
+    }
+  "$tool" -w 2 -t filter -A AGH_DNS_BYPASS -p udp -j REJECT 2>/dev/null ||
+    "$tool" -w 2 -t filter -A AGH_DNS_BYPASS -p udp -j DROP 2>/dev/null || {
+      remove_encrypted_dns_guard "$tool"; return 1;
+    }
+  for proto in udp tcp; do
+    for port in 853 784 8853; do
+      "$tool" -w 2 -t filter -I OUTPUT 1 -p "$proto" -m "$proto" --dport "$port" -j AGH_DNS_BYPASS 2>/dev/null || {
+        remove_encrypted_dns_guard "$tool"; return 1;
+      }
+    done
+  done
+}
+
+remove_ipv6_fallback() {
+  local tool=$1
+  [ -n "$tool" ] || return 0
+  table_available "$tool" filter || return 0
+  delete_output_jump "$tool" filter AGH_DNS6_BLOCK
+  "$tool" -w 2 -t filter -F AGH_DNS6_BLOCK 2>/dev/null
+  "$tool" -w 2 -t filter -X AGH_DNS6_BLOCK 2>/dev/null
+}
+
+ipv6_fallback_installed() {
+  local tool=$1
+  [ -n "$tool" ] || return 1
+  table_available "$tool" filter || return 1
+  "$tool" -w 2 -t filter -C OUTPUT -p udp -m udp --dport 53 -j AGH_DNS6_BLOCK >/dev/null 2>&1 &&
+    "$tool" -w 2 -t filter -C OUTPUT -p tcp -m tcp --dport 53 -j AGH_DNS6_BLOCK >/dev/null 2>&1
+}
+
+network_has_dual_stack_dns() {
+  local snapshot=${AGH_CONNECTIVITY_TEMP:-/dev/.agh-connectivity-fallback.$$}
+  local netid server has4=0 has6=0
+  connectivity_snapshot "$snapshot" || { rm -f "$snapshot"; return 1; }
+  netid=$(active_network_id "$snapshot")
+  case "$netid" in ''|*[!0-9]*) rm -f "$snapshot"; return 1 ;; esac
+  for server in $(active_network_servers "$snapshot" "$netid"); do
+    case "$server" in
+      *:*) is_usable_dns "$server" && has6=1 ;;
+      *.*) is_usable_dns "$server" && has4=1 ;;
+    esac
+  done
+  rm -f "$snapshot"
+  [ "$has4" = 1 ] && [ "$has6" = 1 ]
+}
+
+setup_ipv6_fallback() {
+  local tool=$1 address proto
+  shift
+  [ -n "$tool" ] || return 1
+  table_available "$tool" filter || return 1
+  remove_ipv6_fallback "$tool"
+  "$tool" -w 2 -t filter -N AGH_DNS6_BLOCK 2>/dev/null || return 1
+  for address in "$@"; do
+    "$tool" -w 2 -t filter -A AGH_DNS6_BLOCK -d "$address" -j RETURN 2>/dev/null || {
+      remove_ipv6_fallback "$tool"; return 1;
+    }
+  done
+  "$tool" -w 2 -t filter -A AGH_DNS6_BLOCK -p udp -m udp --dport 53 -j REJECT --reject-with icmp6-port-unreachable 2>/dev/null ||
+    "$tool" -w 2 -t filter -A AGH_DNS6_BLOCK -p udp -m udp --dport 53 -j DROP 2>/dev/null || {
+      remove_ipv6_fallback "$tool"; return 1;
+    }
+  "$tool" -w 2 -t filter -A AGH_DNS6_BLOCK -p tcp -m tcp --dport 53 -j REJECT --reject-with tcp-reset 2>/dev/null ||
+    "$tool" -w 2 -t filter -A AGH_DNS6_BLOCK -p tcp -m tcp --dport 53 -j DROP 2>/dev/null || {
+      remove_ipv6_fallback "$tool"; return 1;
+    }
+  for proto in udp tcp; do
+    "$tool" -w 2 -t filter -C OUTPUT -p "$proto" -m "$proto" --dport 53 -j AGH_DNS6_BLOCK 2>/dev/null ||
+      "$tool" -w 2 -t filter -I OUTPUT 1 -p "$proto" -m "$proto" --dport 53 -j AGH_DNS6_BLOCK 2>/dev/null || {
+        remove_ipv6_fallback "$tool"; return 1;
+      }
+  done
+}
+
+sync_ipv6_dns_fallback() {
+  if table_available "$IP6TABLES" nat; then
+    remove_ipv6_fallback "$IP6TABLES"
+    return 0
+  fi
+  if network_has_dual_stack_dns; then
+    ipv6_fallback_installed "$IP6TABLES" && return 0
+    setup_ipv6_fallback "$IP6TABLES" ::1/128 2400:7fc0:849e:200::4 2404:c2c0:85d8:901::4
+  else
+    # IPv6-only networks must remain usable even when Resolver takeover is
+    # unsupported.  The fallback is safe only when IPv4 DNS can be redirected.
+    remove_ipv6_fallback "$IP6TABLES"
+  fi
+}
+
+install_rules() {
+  # Always begin from a known fail-open state.  In particular, never leave a
+  # partial jump behind when one of the device's iptables backends rejects it.
+  remove_iptables_rules
+  # IDnsResolver sends takeover traffic to 127.0.0.1:53.  Do not exempt the
+  # loopback destination: AdGuard Home listens on 5353 and needs this redirect.
+  setup_chain "$IPTABLES" AGH_DNS 180.184.1.1 180.184.2.2 || {
+    remove_iptables_rules
+    return 1
+  }
+  if table_available "$IP6TABLES" nat; then
+    remove_ipv6_fallback "$IP6TABLES"
+    setup_chain "$IP6TABLES" AGH_DNS6 2400:7fc0:849e:200::4 2404:c2c0:85d8:901::4 || {
+      remove_iptables_rules
+      return 1
+    }
+  else
+    # On dual-stack networks, reject direct IPv6 port 53 so Android immediately
+    # falls back to IPv4, which is redirected above.  IPv6-only networks stay
+    # fail-open and rely on the verified Resolver takeover.
+    sync_ipv6_dns_fallback || log "IPv6 DNS fallback is unavailable"
+  fi
+  setup_encrypted_dns_guard "$IPTABLES" || log "IPv4 encrypted DNS bypass guard is unavailable"
+  setup_encrypted_dns_guard "$IP6TABLES" || log "IPv6 encrypted DNS bypass guard is unavailable"
+  return 0
+}
+
+remove_iptables_rules() {
+  remove_chain "$IPTABLES" nat AGH_DNS
+  if table_available "$IPTABLES" nat; then
+    remove_legacy_redirects "$IPTABLES"
+  fi
+  remove_chain "$IP6TABLES" nat AGH_DNS6
+  if table_available "$IP6TABLES" nat; then
+    remove_legacy_redirects "$IP6TABLES"
+  fi
+  remove_ipv6_fallback "$IP6TABLES"
+  remove_encrypted_dns_guard "$IPTABLES"
+  remove_encrypted_dns_guard "$IP6TABLES"
+}
+
+is_running() {
+  local pid
+  [ -s "$PID_FILE" ] || return 1
+  pid=$(cat "$PID_FILE")
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "AdGuardHome" ]
+}
+
+has_current_launch_environment() {
+  local pid
+  is_running || return 1
+  pid=$(cat "$PID_FILE")
+  [ -s "$LAUNCH_FILE" ] || return 1
+  grep -qx "pid=$pid" "$LAUNCH_FILE" 2>/dev/null &&
+    grep -qx "ssl_cert_file=$CA_BUNDLE" "$LAUNCH_FILE" 2>/dev/null
+}
+
+ensure_default_dns_filter() {
+  local default_url=https://filters.adtidy.org/android/filters/15_optimized.txt
+  local temp=$CONFIG.default-filter.$$
+  [ -s "$CONFIG" ] || return 2
+  grep -Fq "$default_url" "$CONFIG" && return 1
+  awk -v url="$default_url" '
+    /^whitelist_filters:/ && !inserted {
+      print "  - enabled: true"
+      print "    url: " url
+      print "    name: AdGuard DNS Filter"
+      print "    id: 1735560834"
+      inserted = 1
+    }
+    { print }
+    END { if (!inserted) exit 1 }
+  ' "$CONFIG" > "$temp" || {
+    rm -f "$temp"
+    return 2
+  }
+  [ -e "$CONFIG.before-default-filter-migration" ] || cp "$CONFIG" "$CONFIG.before-default-filter-migration"
+  mv "$temp" "$CONFIG"
+  chmod 600 "$CONFIG"
+  log "added the default AdGuard DNS Filter to the existing configuration"
+  return 0
+}
+
+ensure_direct_dns_rules() {
+  local rule temp changed=1
+  [ -s "$CONFIG" ] || return 2
+  while IFS= read -r rule; do
+    [ -n "$rule" ] || continue
+    grep -Fqx "  - '$rule'" "$CONFIG" && continue
+    temp=$CONFIG.direct-dns.$$
+    awk -v rule="$rule" '
+      { print }
+      /^user_rules:/ && !inserted {
+        print "  - \047" rule "\047"
+        inserted = 1
+      }
+      END { if (!inserted) exit 1 }
+    ' "$CONFIG" > "$temp" || { rm -f "$temp"; return 2; }
+    mv "$temp" "$CONFIG" || return 2
+    chmod 600 "$CONFIG"
+    changed=0
+  done <<'EOF'
+||dns.google^$important
+||cloudflare-dns.com^$important
+||security.cloudflare-dns.com^$important
+||family.cloudflare-dns.com^$important
+||one.one.one.one^$important
+||dns.quad9.net^$important
+||dns.adguard-dns.com^$important
+||dns-family.adguard.com^$important
+||dns-unfiltered.adguard.com^$important
+||doh.opendns.com^$important
+||doh.cleanbrowsing.org^$important
+||dns.alidns.com^$important
+@@||xn--4gqx1hgtfdmt.com^$important
+EOF
+  [ "$changed" -eq 0 ] && log "added required DNS compatibility rules"
+  return "$changed"
+}
+
+migrate_config() {
+  [ -s "$CONFIG" ] || return 2
+  local temp=$CONFIG.migrate
+  awk '
+    /^[^ ]/ {
+      if ($0 ~ /^http:/) section = "http"
+      else if ($0 ~ /^dns:/) section = "dns"
+      else section = ""
+    }
+    section == "http" && /^  address:/ { $0 = "  address: 127.0.0.1:3000" }
+    section == "dns" && /^  port:/ { $0 = "  port: 5353" }
+    $0 == "  - '\''||z23r562938.iask.in^$importa'\''" { $0 = "  - '\''||z23r562938.iask.in^$important'\''" }
+    $0 == "  - '\''||sentry.io^$importantnt'\''" { $0 = "  - '\''||sentry.io^$important'\''" }
+    $0 == "  - '\''||tnc*-alisc*.zijieapi.com^$importat'\''" { $0 = "  - '\''||tnc*-alisc*.zijieapi.com^$important'\''" }
+    { print }
+  ' "$CONFIG" > "$temp" || return 2
+  if ! grep -q '^    - ::1$' "$temp"; then
+    awk '{ print; if ($0 == "    - 127.0.0.1") print "    - ::1" }' "$temp" > "$temp.ipv6" || return 2
+    mv "$temp.ipv6" "$temp"
+  fi
+  if cmp -s "$CONFIG" "$temp"; then
+    rm -f "$temp"
+    changed=1
+  else
+    [ -e "$CONFIG.before-port-migration" ] || cp "$CONFIG" "$CONFIG.before-port-migration"
+    [ -e "$CONFIG.before-rule-repair" ] || cp "$CONFIG" "$CONFIG.before-rule-repair"
+    mv "$temp" "$CONFIG"
+    chmod 600 "$CONFIG"
+    log "configuration migration and built-in rule repair completed"
+    changed=0
+  fi
+  ensure_default_dns_filter && changed=0
+  ensure_direct_dns_rules && changed=0
+  return "$changed"
+}
+
+start() {
+  mkdir -p "$DATA_DIR/work" "$DATA_DIR/logs"
+  rm -f "$DISABLED_FILE"
+  # Restore a resolver takeover left by a crash before changing interception.
+  # A failed restore is retained and retried after the local DNS process starts.
+  resolver_restore || log "resolver restore is pending while service starts"
+  remove_iptables_rules
+  if ! build_ca_bundle; then
+    log "failed to build the Android system CA bundle"
+    echo failed
+    return 1
+  fi
+  seed_filter_cache
+  local seeded=$?
+  migrate_config
+  local migrated=$?
+  if is_running; then
+    if [ "$seeded" -eq 0 ] || [ "$migrated" -eq 0 ] || ! has_current_launch_environment; then
+      kill "$(cat "$PID_FILE")" 2>/dev/null
+      sleep 1
+      is_running && kill -9 "$(cat "$PID_FILE")" 2>/dev/null
+      rm -f "$PID_FILE"
+      rm -f "$LAUNCH_FILE"
+    else
+      if ! install_rules; then
+        log "service is running, but DNS interception could not be installed"
+      fi
+      # Re-apply only to the current validated network.  Existing resolver
+      # state is retained so stop/cleanup can restore the user's DNS servers.
+      if resolver_sync; then
+        reset_browser_network_state
+      else
+        log "DNSResolver takeover is unavailable; keeping fail-open"
+      fi
+      proxy_control sync >/dev/null 2>&1 || log "proxy compatibility sync failed"
+      start_app_cleaner
+      echo running
+      return 0
+    fi
+  fi
+  rm -f "$PID_FILE"
+  SSL_CERT_FILE="$CA_BUNDLE" "$AGH_BIN" -c "$CONFIG" -w "$DATA_DIR/work" >> "$LOG_FILE" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$PID_FILE"
+  {
+    echo "pid=$pid"
+    echo "ssl_cert_file=$CA_BUNDLE"
+  } > "$LAUNCH_FILE"
+  sleep 1
+  if is_running; then
+    if ! install_rules; then
+      log "service started without DNS interception"
+      remove_iptables_rules
+    fi
+    if resolver_sync; then
+      reset_browser_network_state
+    else
+      log "DNSResolver takeover is unavailable; keeping fail-open"
+    fi
+    proxy_control sync >/dev/null 2>&1 || log "proxy compatibility sync failed"
+    start_app_cleaner
+    log "service started"
+    echo running
+    return 0
+  fi
+  resolver_restore
+  remove_iptables_rules
+  rm -f "$PID_FILE"
+  rm -f "$LAUNCH_FILE"
+  log "service failed to start"
+  echo failed
+  return 1
+}
+
+stop() {
+  current_boot_id > "$DISABLED_FILE" 2>/dev/null || : > "$DISABLED_FILE"
+  chmod 600 "$DISABLED_FILE" 2>/dev/null
+  # Proxy configurations may use AdGuard Home as their only DNS upstream.
+  # Restore them before stopping the local resolver.
+  proxy_control suspend >/dev/null 2>&1 || log "proxy compatibility suspend failed"
+  stop_app_cleaner
+  # Never kill the only reachable DNS endpoint until Android's resolver has
+  # accepted its original servers.  A missing companion helper therefore
+  # leaves AdGuard Home running instead of disconnecting the whole device.
+  if ! resolver_restore; then
+    rm -f "$DISABLED_FILE"
+    log "refused to stop while system DNS could not be restored"
+    echo restore-failed
+    return 1
+  fi
+  remove_iptables_rules
+  if is_running; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null
+    sleep 1
+    is_running && kill -9 "$(cat "$PID_FILE")" 2>/dev/null
+  fi
+  rm -f "$PID_FILE"
+  rm -f "$LAUNCH_FILE"
+  if ! verify_restored_dns; then
+    # Refresh only Wi-Fi.  Toggling it while cellular/VPN is the active
+    # transport would be a destructive network change unrelated to recovery.
+    if network_is_wifi; then
+      log "restored resolver remained stale on Wi-Fi; cycling Wi-Fi to recover DNS"
+      svc wifi disable >/dev/null 2>&1 || :
+      sleep 1
+      svc wifi enable >/dev/null 2>&1 || :
+      sleep 3
+      verify_restored_dns || log "DNS remained unavailable after Wi-Fi refresh"
+    else
+      log "restored resolver probe failed; leaving non-Wi-Fi transport untouched"
+    fi
+  fi
+  log "service stopped"
+  echo stopped
+}
+
+migrate() {
+  if migrate_config; then
+    stop >/dev/null && start
+  else
+    echo unchanged
+  fi
+}
+
+rules() {
+  if ! is_running; then
+    resolver_restore
+    remove_iptables_rules
+    log "refused DNS interception because the service is not running"
+    echo service-not-running
+    return 1
+  fi
+  if install_rules; then
+    resolver_sync || log "DNSResolver takeover is unavailable; keeping fail-open"
+    proxy_control sync >/dev/null 2>&1 || log "proxy compatibility sync failed"
+    echo rules-installed
+    return 0
+  fi
+  remove_iptables_rules
+  log "DNS interception installation failed and was rolled back"
+  echo rules-failed
+  return 1
+}
+
+network_info() {
+  local snapshot=${AGH_CONNECTIVITY_TEMP:-/dev/.agh-connectivity.$$}
+  local netid server
+  connectivity_snapshot "$snapshot" || {
+    rm -f "$snapshot"
+    return 1
+  }
+  netid=$(active_network_id "$snapshot")
+  echo "netid=$netid"
+  for server in $(active_network_servers "$snapshot" "$netid"); do
+    echo "dns=$server"
+  done
+  rm -f "$snapshot"
+}
+
+clean_logs() {
+  local file
+  mkdir -p "$DATA_DIR/logs" || return 1
+  for file in "$DATA_DIR"/logs/*.log; do
+    [ -f "$file" ] || continue
+    : > "$file" || return 1
+  done
+  log "module logs cleared"
+  echo logs-cleared
+}
+
+export_logs() {
+  local destination=/data/media/0/Download/ADGlogs/ADGrizhi.zip
+  resolver_helper || { echo helper-unavailable; return 1; }
+  mkdir -p "${destination%/*}" || return 1
+  CLASSPATH="$DNS_HELPER_APK" "$APP_PROCESS" /system/bin \
+    com.adguardhome.android.LogExporter "$DATA_DIR/logs" "$destination" || return 1
+  chown 1023:1023 "$destination" 2>/dev/null || :
+  chmod 664 "$destination" 2>/dev/null || :
+  restorecon "$destination" >/dev/null 2>&1 || :
+  echo /storage/emulated/0/Download/ADGlogs/ADGrizhi.zip
+}
+
+case "$1" in
+  start|stop|restart|rules|cleanup|recover|migrate|filter-seed|factory-rules|network-failsafe|network-alert-ack|proxy-enable|proxy-disable|proxy-sync|proxy-path-add|proxy-path-delete|proxy-subscription-set|proxy-subscription-apply|proxy-subscription-delete|logs-clean|logs-export)
+    mkdir -p "$DATA_DIR/logs" 2>/dev/null
+    echo "$(date '+%Y-%m-%d %H:%M:%S') control action: $1" >> "$DATA_DIR/logs/control.log"
+    ;;
+esac
+
+case "$1" in
+  start|stop|restart|rules|cleanup|recover|migrate|sync|resolver-sync|filter-seed|network-failsafe|network-alert-ack|proxy-enable|proxy-disable|proxy-sync|proxy-path-add|proxy-path-delete|proxy-subscription-set|proxy-subscription-apply|proxy-subscription-delete|logs-clean|logs-export)
+    acquire_control_lock "$1" || { echo busy; exit 75; } ;;
+esac
+
+case "$1" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop && start ;;
+  status) is_running && echo running || echo stopped ;;
+  rules) rules ;;
+  filter-seed) seed_filter_cache; result=$?; [ "$result" -eq 0 ] || [ "$result" -eq 1 ]; echo filter-cache-ready ;;
+  factory-rules) factory_rules ;;
+  network-failsafe) network_failsafe ;;
+  network-alert) network_alert ;;
+  network-alert-ack) network_alert_ack ;;
+  network-watch) network_watch ;;
+  cleanup) stop_app_cleaner; proxy_control suspend >/dev/null 2>&1; resolver_restore; result=$?; remove_iptables_rules; echo rules-removed; exit "$result" ;;
+  recover) stop ;;
+  resolver-sync) resolver_sync ;;
+  sync) sync_all ;;
+  proxy-enable) proxy_control enable ;;
+  proxy-disable) proxy_control disable ;;
+  proxy-status) proxy_control status ;;
+  proxy-sync) proxy_control sync ;;
+  proxy-paths) proxy_control paths ;;
+  proxy-path-add) proxy_control path-add "$2" ;;
+  proxy-path-delete) proxy_control path-delete "$2" ;;
+  proxy-subscription) proxy_control subscription ;;
+  proxy-subscription-set) proxy_control subscription-set "$2" ;;
+  proxy-subscription-apply) proxy_control subscription-apply "$2" ;;
+  proxy-subscription-delete) proxy_control subscription-delete ;;
+  logs-clean) clean_logs ;;
+  logs-export) export_logs ;;
+  network-info) network_info ;;
+  migrate) migrate ;;
+  *) echo "Usage: $0 {start|stop|restart|status|rules|cleanup|network-info|migrate|filter-seed|factory-rules|network-failsafe|network-alert|network-alert-ack|proxy-enable|proxy-disable|proxy-status|proxy-sync|proxy-paths|proxy-path-add|proxy-path-delete|proxy-subscription|proxy-subscription-set|proxy-subscription-apply|proxy-subscription-delete|logs-clean|logs-export}"; exit 64 ;;
+esac

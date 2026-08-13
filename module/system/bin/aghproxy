@@ -1,0 +1,680 @@
+#!/system/bin/sh
+
+MODDIR=${AGH_MODDIR:-${0%/*}/../..}
+DATA_DIR=${AGH_DATA_DIR:-/data/adb/agh}
+STATE_DIR=$DATA_DIR/proxy-compat
+ENABLED_FILE=$STATE_DIR/enabled
+ACTIVE_FILE=$STATE_DIR/active
+LOG_FILE=$DATA_DIR/logs/proxy-compat.log
+PATHS_FILE=$STATE_DIR/paths.conf
+SUBSCRIPTION_FILE=$STATE_DIR/subscription.url
+RELOAD_STATE_DIR=$STATE_DIR/reloaded
+CONTROL_LOCK=$DATA_DIR/proxy-compat.lock
+LOCAL_DNS=127.0.0.1:5353
+HELPER_APK=
+APP_PROCESS=
+CHANGED_BOX_BLL=0
+CHANGED_BOX=0
+CHANGED_CLASH=0
+CHANGED_CLASH_MODULE=0
+DETECTED=0
+
+log() {
+  mkdir -p "${LOG_FILE%/*}" 2>/dev/null
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
+}
+
+acquire_proxy_lock() {
+  local waited=0 owner
+  mkdir -p "$DATA_DIR" "$STATE_DIR" 2>/dev/null || return 1
+  while ! mkdir "$CONTROL_LOCK" 2>/dev/null; do
+    owner=$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$CONTROL_LOCK/owner" 2>/dev/null | head -n 1)
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$CONTROL_LOCK" 2>/dev/null
+      continue
+    fi
+    [ "$waited" -ge 15 ] && { log "proxy action busy; refusing overlap: $1"; return 75; }
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "pid=$$ action=$1" > "$CONTROL_LOCK/owner"
+  trap 'rm -rf "$CONTROL_LOCK" 2>/dev/null' EXIT HUP INT TERM
+  return 0
+}
+
+editor_helper() {
+  local bundled=$MODDIR/system/etc/agh-dns-helper.apk
+  if [ -n "$HELPER_APK" ] && [ -f "$HELPER_APK" ] && [ -n "$APP_PROCESS" ]; then
+    return 0
+  fi
+  if [ -f "$bundled" ]; then
+    HELPER_APK=$bundled
+  else
+    HELPER_APK=$(pm path com.adguardhome.android 2>/dev/null | sed -n 's/^package://p' | head -n 1)
+  fi
+  [ -n "$HELPER_APK" ] && [ -f "$HELPER_APK" ] || return 1
+  if [ -x /system/bin/app_process64 ]; then
+    APP_PROCESS=/system/bin/app_process64
+  elif [ -x /system/bin/app_process ]; then
+    APP_PROCESS=/system/bin/app_process
+  else
+    return 1
+  fi
+}
+
+editor_call() {
+  local operation=$1 file=$2
+  editor_helper || return 1
+  if [ -s "$SUBSCRIPTION_FILE" ]; then
+    CLASSPATH="$HELPER_APK" "$APP_PROCESS" /system/bin \
+      com.adguardhome.android.ProxyConfigEditor "$operation" "$file" "$LOCAL_DNS" "$(cat "$SUBSCRIPTION_FILE")"
+  else
+    CLASSPATH="$HELPER_APK" "$APP_PROCESS" /system/bin \
+      com.adguardhome.android.ProxyConfigEditor "$operation" "$file" "$LOCAL_DNS"
+  fi
+}
+
+hash_value() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    cksum | awk '{print $1 "-" $2}'
+  fi
+}
+
+hash_file() {
+  [ -f "$1" ] || return 1
+  hash_value < "$1"
+}
+
+file_key() {
+  printf '%s' "$1" | hash_value
+}
+
+write_state() {
+  local meta=$1 path=$2 backup=$3 patched=$4 group=$5 temp=$meta.tmp.$$
+  {
+    echo "path=$path"
+    echo "backup=$backup"
+    echo "patched=$patched"
+    echo "group=$group"
+  } > "$temp" || return 1
+  chmod 600 "$temp"
+  mv "$temp" "$meta"
+}
+
+restore_file_metadata() {
+  local file=$1 ownership=$2 context=$3
+  [ -n "$ownership" ] && chown "$ownership" "$file" 2>/dev/null || return 1
+  if [ -n "$context" ] && command -v chcon >/dev/null 2>&1; then
+    chcon "$context" "$file" 2>/dev/null || return 1
+  fi
+  return 0
+}
+
+restore_backup_in_place() {
+  local backup=$1 file=$2 ownership=$3 context=$4
+  [ -f "$backup" ] || return 1
+  if [ -f "$file" ]; then
+    cat "$backup" > "$file" || return 1
+  else
+    cp -p "$backup" "$file" || return 1
+  fi
+  [ -z "$ownership" ] || restore_file_metadata "$file" "$ownership" "$context"
+}
+
+register_path() {
+  local source=$1 group=$2 path=$3 temp
+  mkdir -p "$STATE_DIR" || return 1
+  if [ -f "$PATHS_FILE" ] && awk -F '\t' -v wanted="$path" '$3 == wanted { found=1 } END { exit !found }' "$PATHS_FILE"; then
+    return 0
+  fi
+  temp=$PATHS_FILE.tmp.$$
+  [ -f "$PATHS_FILE" ] && cat "$PATHS_FILE" > "$temp"
+  printf '%s\t%s\t%s\n' "$source" "$group" "$path" >> "$temp" || return 1
+  chmod 600 "$temp"
+  mv "$temp" "$PATHS_FILE"
+  log "registered $source proxy config: $path"
+}
+
+remove_registered_path() {
+  local path=$1 temp=$PATHS_FILE.tmp.$$
+  [ -f "$PATHS_FILE" ] || return 0
+  awk -F '\t' -v wanted="$path" '$3 != wanted' "$PATHS_FILE" > "$temp" || return 1
+  chmod 600 "$temp"
+  mv "$temp" "$PATHS_FILE"
+}
+
+apply_one() {
+  local file=$1 group=$2 source=${3:-auto} register=${4:-1} check key backup meta output patched was_running=0 current previous_patched ownership context
+  [ -f "$file" ] || return 0
+  check=$(editor_call check "$file" 2>> "$LOG_FILE") || return 0
+  DETECTED=$((DETECTED + 1))
+  [ "$register" = 0 ] || register_path "$source" "$group" "$file" || return 1
+  if [ "$check" != "needs-change" ]; then
+    return 0
+  fi
+  group_running "$group" && was_running=1
+  ownership=$(stat -c '%u:%g' "$file" 2>/dev/null) || return 1
+  context=$(ls -Zd "$file" 2>/dev/null | awk '{print $1}')
+
+  mkdir -p "$STATE_DIR/backups" "$STATE_DIR/state" || return 1
+  key=$(file_key "$file") || return 1
+  backup=$STATE_DIR/backups/$key.yaml
+  meta=$STATE_DIR/state/$key.state
+  current=$(hash_file "$file") || return 1
+  previous_patched=$(sed -n 's/^patched=//p' "$meta" 2>/dev/null | head -n 1)
+  if [ ! -f "$backup" ] || [ -z "$previous_patched" ] || [ "$current" != "$previous_patched" ]; then
+    cp -p "$file" "$backup.tmp.$$" || return 1
+    mv "$backup.tmp.$$" "$backup" || return 1
+  fi
+  output=$(editor_call apply "$file" 2>> "$LOG_FILE") || {
+    restore_backup_in_place "$backup" "$file" "$ownership" "$context" 2>/dev/null
+    log "failed to adapt proxy config: $file"
+    return 1
+  }
+  [ "$output" = "changed" ] || return 0
+  if ! restore_file_metadata "$file" "$ownership" "$context"; then
+    restore_backup_in_place "$backup" "$file" "$ownership" "$context" 2>/dev/null
+    log "failed to preserve proxy config ownership or SELinux context: $file"
+    return 1
+  fi
+  patched=$(hash_file "$file") || return 1
+  write_state "$meta" "$file" "$backup" "$patched" "$group" || return 1
+  log "adapted proxy config for redir-host: $file"
+  if [ "$was_running" = 1 ]; then
+    case "$group" in
+      box_bll) CHANGED_BOX_BLL=1 ;;
+      box) CHANGED_BOX=1 ;;
+      clash) CHANGED_CLASH=1 ;;
+      clash_module) CHANGED_CLASH_MODULE=1 ;;
+      cmfa_alpha|cmfa_meta) reload_android_profile "$group" "$file" ;;
+      clash_android) reload_android_profile "$group" "$file" ;;
+    esac
+  fi
+}
+
+process_pattern() {
+  local group=$1 pattern=$2 file
+  for file in $pattern; do
+    [ -f "$file" ] && apply_one "$file" "$group" auto
+  done
+}
+
+process_manual_paths() {
+  local source group path tab list file
+  [ -f "$PATHS_FILE" ] || return 0
+  tab=$(printf '\t')
+  while IFS="$tab" read -r source group path; do
+    [ "$source" = manual ] || continue
+    if [ -f "$path" ]; then
+      apply_one "$path" custom manual
+    elif [ -d "$path" ]; then
+      list=$STATE_DIR/manual-find.$$
+      find "$path" -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null > "$list"
+      while IFS= read -r file; do
+        [ -f "$file" ] && apply_one "$file" custom manual 0
+      done < "$list"
+      rm -f "$list"
+    fi
+  done < "$PATHS_FILE"
+}
+
+restart_changed() {
+  if [ "$CHANGED_BOX_BLL" = 1 ] && [ -x /data/adb/box_bll/scripts/box.service ]; then
+    /data/adb/box_bll/scripts/box.service restart >> "$LOG_FILE" 2>&1 || log "box_bll restart failed"
+  fi
+  if [ "$CHANGED_BOX" = 1 ] && [ -x /data/adb/box/scripts/box.service ]; then
+    /data/adb/box/scripts/box.service restart >> "$LOG_FILE" 2>&1 || log "box restart failed"
+  fi
+  if [ "$CHANGED_CLASH" = 1 ] && [ -x /data/clash/scripts/clash.service ]; then
+    /data/clash/scripts/clash.service -k >> "$LOG_FILE" 2>&1
+    /data/clash/scripts/clash.service -s >> "$LOG_FILE" 2>&1 || log "clash service restart failed"
+  fi
+  if [ "$CHANGED_CLASH_MODULE" = 1 ] && [ -x /data/adb/modules/Clash/Scripts/Clash.Service ]; then
+    /data/adb/modules/Clash/Scripts/Clash.Service stop >> "$LOG_FILE" 2>&1
+    /data/adb/modules/Clash/Scripts/Clash.Service start >> "$LOG_FILE" 2>&1 || log "Clash module restart failed"
+  fi
+}
+
+group_running() {
+  case "$1" in
+    box_bll) pgrep -f '/data/adb/box_bll/' >/dev/null 2>&1 ;;
+    box) pgrep -f '/data/adb/box/' >/dev/null 2>&1 ;;
+    clash) pgrep -f '/data/clash/' >/dev/null 2>&1 ;;
+    clash_module) pgrep -f '/data/adb/modules/Clash/' >/dev/null 2>&1 ;;
+    cmfa_alpha) pgrep -f 'com.github.metacubex.clash.alpha' >/dev/null 2>&1 ;;
+    cmfa_meta) pgrep -f 'com.github.metacubex.clash.meta' >/dev/null 2>&1 ;;
+    clash_android) pgrep -f 'com.github.kr328.clash' >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+android_vpn_running() {
+  local package=$1 uid
+  pgrep -f "$package" >/dev/null 2>&1 || return 1
+  uid=$(pm list packages -U "$package" 2>/dev/null | sed -n 's/.* uid:\([0-9][0-9]*\).*/\1/p' | head -n 1)
+  case "$uid" in ''|*[!0-9]*) return 1 ;; esac
+  # Inspect actual network agents only.  Connectivity callback registrations
+  # contain both the package name and "Transports: VPN" even while the VPN is
+  # stopped, which previously made a background app process look active.
+  dumpsys connectivity 2>/dev/null | awk -v uid="$uid" '
+    index($0, "NetworkAgentInfo{network{") {
+      if (index($0, "Transports: VPN") && index($0, "OwnerUid: " uid)) found=1
+    }
+    END { exit found ? 0 : 1 }
+  '
+}
+
+proxy_group_active() {
+  case "$1" in
+    cmfa_alpha) android_vpn_running com.github.metacubex.clash.alpha ;;
+    cmfa_meta) android_vpn_running com.github.metacubex.clash.meta ;;
+    clash_android) android_vpn_running com.github.kr328.clash ;;
+    box_bll|box|clash|clash_module) group_running "$1" ;;
+    custom) any_supported_proxy_active ;;
+    *) return 1 ;;
+  esac
+}
+
+any_supported_proxy_active() {
+  local group
+  for group in box_bll box clash clash_module cmfa_alpha cmfa_meta clash_android; do
+    proxy_group_active "$group" && return 0
+  done
+  return 1
+}
+
+active_proxy_groups() {
+  local group
+  for group in box_bll box clash clash_module cmfa_alpha cmfa_meta clash_android; do
+    proxy_group_active "$group" && echo "$group"
+  done
+}
+
+android_package() {
+  case "$1" in
+    cmfa_alpha) echo com.github.metacubex.clash.alpha ;;
+    cmfa_meta) echo com.github.metacubex.clash.meta ;;
+    clash_android) echo com.github.kr328.clash ;;
+    *) return 1 ;;
+  esac
+}
+
+reload_android_profile() {
+  local group=$1 file=$2 package uuid
+  package=$(android_package "$group") || return 0
+  uuid=${file%/config.yaml}
+  uuid=${uuid##*/}
+  case "$uuid" in
+    ????????-????-????-????-????????????) ;;
+    *) log "cannot reload Android proxy profile with invalid UUID: $file"; return 0 ;;
+  esac
+  # The service listens for this private broadcast and reloads the active
+  # profile in place.  group_running() is checked by the caller, so this never
+  # starts a stopped proxy app or toggles its VPN service.
+  am broadcast --user 0 -a "$package.intent.action.PROFILE_CHANGED" -p "$package" \
+    --es uuid "$uuid" >/dev/null 2>&1 || log "Android proxy profile reload failed: $package $uuid"
+}
+
+reload_android_profile_if_needed() {
+  local group=$1 file=$2 key hash marker temp
+  key=$(file_key "$file") || return 1
+  hash=$(hash_file "$file") || return 1
+  marker=$RELOAD_STATE_DIR/$key.state
+  [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$hash" ] && return 0
+  reload_android_profile "$group" "$file" || return 1
+  mkdir -p "$RELOAD_STATE_DIR" || return 1
+  temp=$marker.tmp.$$
+  printf '%s\n' "$hash" > "$temp" || return 1
+  chmod 600 "$temp"
+  mv "$temp" "$marker"
+}
+
+android_profile_url() {
+  local group=$1 file=$2 package uuid database
+  package=$(android_package "$group") || return 0
+  uuid=${file%/config.yaml}
+  uuid=${uuid##*/}
+  case "$uuid" in ????????-????-????-????-????????????) ;; *) return 0 ;; esac
+  database=/data/user/0/$package/databases/profiles
+  [ -f "$database" ] || return 0
+  editor_helper || return 0
+  CLASSPATH="$HELPER_APK" "$APP_PROCESS" /system/bin \
+    com.adguardhome.android.ProxyProfileReader "$database" "$uuid" 2>/dev/null
+}
+
+sync_configs() {
+  local active_groups
+  [ -f "$ENABLED_FILE" ] || { echo disabled; return 0; }
+  active_groups=$(active_proxy_groups)
+  if [ -z "$active_groups" ]; then
+    if [ -f "$ACTIVE_FILE" ] || [ -d "$STATE_DIR/state" ]; then
+      restore_configs >/dev/null || return 1
+      rm -f "$ACTIVE_FILE"
+      rm -rf "$RELOAD_STATE_DIR"
+      log "proxy stopped; restored normal filtering configuration"
+    fi
+    echo 0 > "$STATE_DIR/detected"
+    echo waiting-for-proxy
+    return 0
+  fi
+  editor_helper || { log "proxy compatibility helper is unavailable"; echo helper-unavailable; return 1; }
+  DETECTED=0
+  proxy_group_active box_bll && process_pattern box_bll '/data/adb/box_bll/clash/*.yaml'
+  proxy_group_active box_bll && process_pattern box_bll '/data/adb/box_bll/clash/*.yml'
+  proxy_group_active box_bll && process_pattern box_bll '/data/adb/box_bll/mihomo/*.yaml'
+  proxy_group_active box_bll && process_pattern box_bll '/data/adb/box_bll/mihomo/*.yml'
+  proxy_group_active box && process_pattern box '/data/adb/box/clash/*.yaml'
+  proxy_group_active box && process_pattern box '/data/adb/box/clash/*.yml'
+  proxy_group_active box && process_pattern box '/data/adb/box/mihomo/*.yaml'
+  proxy_group_active box && process_pattern box '/data/adb/box/mihomo/*.yml'
+  proxy_group_active clash && process_pattern clash '/data/clash/*.yaml'
+  proxy_group_active clash && process_pattern clash '/data/clash/*.yml'
+  proxy_group_active clash_module && process_pattern clash_module '/data/media/0/Android/Clash/*.yaml'
+  proxy_group_active clash_module && process_pattern clash_module '/data/media/0/Android/Clash/*.yml'
+  proxy_group_active cmfa_alpha && process_pattern cmfa_alpha '/data/user/0/com.github.metacubex.clash.alpha/files/imported/*/config.yaml'
+  proxy_group_active cmfa_meta && process_pattern cmfa_meta '/data/user/0/com.github.metacubex.clash.meta/files/imported/*/config.yaml'
+  proxy_group_active clash_android && process_pattern clash_android '/data/user/0/com.github.kr328.clash/files/imported/*/config.yaml'
+  process_manual_paths
+  echo "$DETECTED" > "$STATE_DIR/detected"
+  chmod 600 "$STATE_DIR/detected" 2>/dev/null
+  restart_changed
+  if [ "$DETECTED" -gt 0 ]; then
+    printf '%s\n' "$active_groups" > "$ACTIVE_FILE"
+    chmod 600 "$ACTIVE_FILE"
+    echo "active detected=$DETECTED"
+  else
+    rm -f "$ACTIVE_FILE"
+    echo no-supported-config
+  fi
+}
+
+watch_compat() {
+  local active_groups previous
+  [ -f "$ENABLED_FILE" ] || { echo disabled; return 0; }
+  active_groups=$(active_proxy_groups)
+  previous=$(cat "$ACTIVE_FILE" 2>/dev/null)
+  if [ -z "$active_groups" ]; then
+    if [ -n "$previous" ] || [ -d "$STATE_DIR/state" ]; then
+      suspend_compat >/dev/null || return 1
+      log "proxy stopped; normal filtering restored"
+      echo restored
+    else
+      echo waiting-for-proxy
+    fi
+    return 0
+  fi
+  if [ "$active_groups" != "$previous" ]; then
+    log "proxy runtime changed; applying compatibility: $(printf '%s' "$active_groups" | tr '\n' ' ')"
+    sync_configs
+  else
+    echo steady-active
+  fi
+}
+
+restore_configs() {
+  local meta path backup patched current group ownership context restored=0 skipped=0
+  [ -d "$STATE_DIR/state" ] || { echo restored=0; return 0; }
+  for meta in "$STATE_DIR"/state/*.state; do
+    [ -f "$meta" ] || continue
+    path=$(sed -n 's/^path=//p' "$meta" | head -n 1)
+    backup=$(sed -n 's/^backup=//p' "$meta" | head -n 1)
+    patched=$(sed -n 's/^patched=//p' "$meta" | head -n 1)
+    group=$(sed -n 's/^group=//p' "$meta" | head -n 1)
+    if [ ! -f "$path" ] || [ ! -f "$backup" ]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    current=$(hash_file "$path")
+    if [ -n "$patched" ] && [ "$current" = "$patched" ]; then
+      ownership=$(stat -c '%u:%g' "$path" 2>/dev/null)
+      context=$(ls -Zd "$path" 2>/dev/null | awk '{print $1}')
+      restore_backup_in_place "$backup" "$path" "$ownership" "$context" && {
+        rm -f "$meta" "$backup"
+        restored=$((restored + 1))
+        log "restored proxy config: $path"
+        if proxy_group_active "$group"; then
+          case "$group" in
+            box_bll) CHANGED_BOX_BLL=1 ;;
+            box) CHANGED_BOX=1 ;;
+            clash) CHANGED_CLASH=1 ;;
+          clash_module) CHANGED_CLASH_MODULE=1 ;;
+          cmfa_alpha|cmfa_meta|clash_android) reload_android_profile "$group" "$path" ;;
+          esac
+        fi
+      }
+    else
+      skipped=$((skipped + 1))
+      log "proxy config changed after adaptation; automatic restore skipped: $path"
+    fi
+  done
+  restart_changed
+  echo "restored=$restored skipped=$skipped"
+}
+
+enable_compat() {
+  if [ ! -s "$SUBSCRIPTION_FILE" ]; then
+    echo subscription-required
+    log "proxy compatibility enable refused because subscription URL is not configured"
+    return 2
+  fi
+  mkdir -p "$STATE_DIR" || return 1
+  : > "$ENABLED_FILE"
+  chmod 600 "$ENABLED_FILE"
+  sync_configs || return $?
+}
+
+disable_compat() {
+  rm -f "$ENABLED_FILE"
+  rm -f "$ACTIVE_FILE"
+  rm -rf "$RELOAD_STATE_DIR"
+  restore_configs
+}
+
+suspend_compat() {
+  rm -f "$ACTIVE_FILE"
+  rm -rf "$RELOAD_STATE_DIR"
+  restore_configs
+}
+
+decode_path() {
+  case "$1" in ''|*[!A-Za-z0-9+/=]*) return 1 ;; esac
+  printf '%s' "$1" | base64 -d 2>/dev/null
+}
+
+validate_manual_path() {
+  local path=$1 resolved
+  [ "$(printf '%s' "$path" | wc -l)" -eq 0 ] || return 1
+  case "$path" in *"$(printf '\t')"*) return 1 ;; esac
+  resolved=$(readlink -f "$path" 2>/dev/null) || return 1
+  case "$resolved" in
+    /data/adb/*|/data/user/*|/data/data/*|/data/media/0/*|/storage/emulated/0/*|/sdcard/*) ;;
+    *) return 1 ;;
+  esac
+  if [ -f "$resolved" ]; then
+    case "$resolved" in *.yaml|*.yml) ;; *) return 1 ;; esac
+  elif [ ! -d "$resolved" ]; then
+    return 1
+  fi
+  printf '%s\n' "$resolved"
+}
+
+add_manual_path() {
+  local decoded path check
+  decoded=$(decode_path "$1") || { echo invalid-path; return 2; }
+  path=$(validate_manual_path "$decoded") || { echo invalid-path; return 2; }
+  if [ -f "$path" ]; then
+    check=$(editor_call check "$path" 2>> "$LOG_FILE") || { echo unsupported-config; return 3; }
+  fi
+  register_path manual custom "$path" || return 1
+  if [ -f "$ENABLED_FILE" ]; then
+    if [ -d "$path" ]; then
+      sync_configs >/dev/null || return 1
+    else
+      apply_one "$path" custom manual || return 1
+    fi
+  fi
+  echo added
+}
+
+restore_registered_path() {
+  local wanted=$1 meta path backup patched current group ownership context
+  [ -d "$STATE_DIR/state" ] || return 0
+  for meta in "$STATE_DIR"/state/*.state; do
+    [ -f "$meta" ] || continue
+    path=$(sed -n 's/^path=//p' "$meta" | head -n 1)
+    case "$path" in "$wanted"|"$wanted"/*) ;; *) continue ;; esac
+    backup=$(sed -n 's/^backup=//p' "$meta" | head -n 1)
+    patched=$(sed -n 's/^patched=//p' "$meta" | head -n 1)
+    group=$(sed -n 's/^group=//p' "$meta" | head -n 1)
+    current=$(hash_file "$path")
+    if [ -f "$backup" ] && [ -n "$patched" ] && [ "$current" = "$patched" ]; then
+      ownership=$(stat -c '%u:%g' "$path" 2>/dev/null)
+      context=$(ls -Zd "$path" 2>/dev/null | awk '{print $1}')
+      restore_backup_in_place "$backup" "$path" "$ownership" "$context" || return 1
+      rm -f "$meta" "$backup"
+      if proxy_group_active "$group"; then
+        case "$group" in
+          box_bll) CHANGED_BOX_BLL=1 ;;
+          box) CHANGED_BOX=1 ;;
+          clash) CHANGED_CLASH=1 ;;
+          clash_module) CHANGED_CLASH_MODULE=1 ;;
+          cmfa_alpha|cmfa_meta|clash_android) reload_android_profile "$group" "$path" ;;
+        esac
+      fi
+      log "restored removed proxy config path: $path"
+    fi
+  done
+}
+
+delete_path() {
+  local decoded path
+  decoded=$(decode_path "$1") || { echo invalid-path; return 2; }
+  path=$(readlink -f "$decoded" 2>/dev/null)
+  [ -n "$path" ] || path=$decoded
+  restore_registered_path "$path" || return 1
+  remove_registered_path "$path" || return 1
+  restart_changed
+  echo deleted
+}
+
+list_paths() {
+  local source group path tab urls encoded list file
+  [ -f "$PATHS_FILE" ] || return 0
+  tab=$(printf '\t')
+  while IFS="$tab" read -r source group path; do
+    urls=
+    if [ -f "$path" ]; then
+      urls=$({
+        editor_call urls "$path" 2>/dev/null
+        case "$group" in cmfa_alpha|cmfa_meta|clash_android) android_profile_url "$group" "$path" ;; esac
+      } | sort -u)
+    elif [ -d "$path" ]; then
+      list=$STATE_DIR/list-find.$$
+      : > "$list"
+      find "$path" -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | while IFS= read -r file; do
+        editor_call urls "$file" 2>/dev/null
+      done | sort -u > "$list"
+      urls=$(cat "$list" 2>/dev/null)
+      rm -f "$list"
+    fi
+    if [ -n "$urls" ]; then
+      encoded=$(printf '%s' "$urls" | base64 2>/dev/null | tr -d '\r\n')
+      printf '%s\t%s\t%s\t%s\n' "$source" "$group" "$path" "$encoded"
+    else
+      printf '%s\t%s\t%s\n' "$source" "$group" "$path"
+    fi
+  done < "$PATHS_FILE"
+}
+
+set_subscription() {
+  local decoded urls temp count defer_sync=$2
+  decoded=$(decode_path "$1") || { echo invalid-url; return 2; }
+  urls=$(printf '%s\n' "$decoded" | awk 'NF { if ($0 !~ /^https?:\/\// || $0 ~ /[ \t\r]/) exit 2; if (!seen[$0]++) print $0 }') || { echo invalid-url; return 2; }
+  count=$(printf '%s\n' "$urls" | awk 'NF { n++ } END { print n + 0 }')
+  [ "$count" -gt 0 ] || { echo invalid-url; return 2; }
+  if [ -s "$SUBSCRIPTION_FILE" ] && [ "$(cat "$SUBSCRIPTION_FILE" 2>/dev/null)" = "$urls" ]; then
+    echo saved
+    return 0
+  fi
+  mkdir -p "$STATE_DIR" || return 1
+  temp=$SUBSCRIPTION_FILE.tmp.$$
+  printf '%s\n' "$urls" > "$temp" || return 1
+  chmod 600 "$temp"
+  mv "$temp" "$SUBSCRIPTION_FILE" || return 1
+  if [ -f "$ENABLED_FILE" ] && [ "$defer_sync" != "defer-sync" ]; then
+    sync_configs >/dev/null || { echo sync-failed; return 1; }
+  fi
+  echo saved
+}
+
+apply_subscription() {
+  set_subscription "$1" defer-sync || return $?
+  mkdir -p "$STATE_DIR" || return 1
+  : > "$ENABLED_FILE" || return 1
+  chmod 600 "$ENABLED_FILE"
+  if any_supported_proxy_active; then
+    if ! sync_configs; then
+      log "subscription saved; compatibility synchronization deferred after failure"
+      echo saved-sync-pending
+    fi
+  else
+    echo waiting-for-proxy
+  fi
+  # The subscription is already durable.  A runtime adaptation failure is
+  # retried by the one-second watcher and must not make the manager discard
+  # local metadata such as the user's subscription note.
+  return 0
+}
+
+delete_subscription() {
+  if [ -f "$ENABLED_FILE" ]; then
+    rm -f "$ENABLED_FILE"
+    rm -rf "$RELOAD_STATE_DIR"
+    restore_configs >/dev/null || return 1
+  fi
+  rm -f "$SUBSCRIPTION_FILE"
+  echo deleted
+}
+
+show_subscription() {
+  [ -s "$SUBSCRIPTION_FILE" ] && cat "$SUBSCRIPTION_FILE"
+}
+
+status_compat() {
+  local managed=0 detected=0
+  if [ -d "$STATE_DIR/state" ]; then
+    for meta in "$STATE_DIR"/state/*.state; do [ -f "$meta" ] && managed=$((managed + 1)); done
+  fi
+  [ -s "$STATE_DIR/detected" ] && detected=$(cat "$STATE_DIR/detected" 2>/dev/null)
+  if [ -f "$ACTIVE_FILE" ]; then
+    echo "active detected=$detected managed=$managed mode=redir-host dns=$LOCAL_DNS"
+  elif [ -f "$ENABLED_FILE" ]; then
+    echo "waiting detected=$detected managed=$managed"
+  else
+    echo "disabled detected=$detected managed=$managed"
+  fi
+}
+
+case "$1" in
+  enable|disable|sync|watch|suspend|path-add|path-delete|subscription-set|subscription-apply|subscription-delete)
+    acquire_proxy_lock "$1" || { echo busy; exit 75; } ;;
+esac
+
+case "$1" in
+  enable) enable_compat ;;
+  disable) disable_compat ;;
+  sync) sync_configs ;;
+  watch) watch_compat ;;
+  suspend) suspend_compat ;;
+  status) status_compat ;;
+  paths) list_paths ;;
+  path-add) add_manual_path "$2" ;;
+  path-delete) delete_path "$2" ;;
+  subscription) show_subscription ;;
+  subscription-set) set_subscription "$2" ;;
+  subscription-apply) apply_subscription "$2" ;;
+  subscription-delete) delete_subscription ;;
+  *) echo "Usage: $0 {enable|disable|sync|watch|suspend|status|paths|path-add|path-delete|subscription|subscription-set|subscription-apply|subscription-delete}"; exit 64 ;;
+esac
