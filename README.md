@@ -2,7 +2,6 @@
 
 一个面向 `arm64-v8a` Android 设备的本地 DNS 过滤方案。项目将 AdGuard Home 作为 Magisk / KernelSU 模块中的常驻 DNS 服务运行，并提供原生 Android 管理器、受限特权控制桥、系统 DNS 接管、代理兼容、网络故障保护和完整恢复机制。
 
-
 ## 项目特点
 
 - **系统级过滤**：通过 Android DNSResolver 与独立 iptables 规则链接管 DNS，不依赖 VPN 广告过滤应用长期占用 VPN 槽位。
@@ -15,6 +14,7 @@
 - **崩溃自愈**：服务监督器检测核心进程，先清理残留接管规则，再按退避策略重新启动。
 - **可审计恢复**：安装时保存 IFW、私有 DNS和出厂自定义规则；卸载时恢复 IFW 与系统网络状态。
 - **集中日志**：模块日志统一写入 `/data/adb/agh/logs`，管理器支持清理和打包导出。
+- **暂停倒计时**：有时限暂停期间持续显示剩余时间通知，到期后自动恢复过滤；不支持增强通知形态的设备继续使用普通通知。
 
 ## 总体架构
 
@@ -25,6 +25,7 @@ flowchart TB
         RESOLVER["Android DNSResolver / netd"]
         IPT["独立 iptables / ip6tables 链"]
         NET["Wi-Fi / 移动网络 / VPN"]
+        SYSTEMUI["SystemUI\n暂停倒计时通知"]
     end
 
     subgraph Module["Root 模块 /data/adb/modules/adguardhome"]
@@ -41,12 +42,18 @@ flowchart TB
         UI["Compose / Miuix / Material UI"]
         API["AdGuard Home API Client"]
         MCC["ModuleControlClient"]
+        TIMER["PauseCountdownService\n前台倒计时与自动恢复"]
     end
 
     APP --> RESOLVER --> IPT --> AGH
     AGH -->|"DoH / DNS 上游查询"| NET
     UI --> API -->|"127.0.0.1:3000"| AGH
     UI --> MCC --> BRIDGE --> CTL
+    UI -->|"开始或取消有时限暂停"| TIMER
+    TIMER -->|"持续更新剩余时间"| SYSTEMUI
+    SYSTEMUI -->|"点击通知"| UI
+    SYSTEMUI -->|"立即恢复"| TIMER
+    TIMER -->|"到期恢复保护"| API
     SUP --> AGH
     SUP --> BRIDGE
     SUP --> PROXY
@@ -68,6 +75,7 @@ flowchart TB
 | `aghappclean` | 维护私有 DNS 与 IFW 等系统策略；过滤运行期间每 60 秒执行一次 |
 | `aghnetwatch` | 常驻网络观察进程；在符合条件的异常网络上触发现场快照和安全退出 |
 | Android 管理器 | 展示状态、调用 AdGuard Home API、通过控制桥执行模块级操作 |
+| `PauseCountdownService` | 在有时限暂停期间以前台服务维护倒计时通知，到期后通过本地 API 自动恢复保护 |
 
 ## DNS 过滤链路
 
@@ -189,7 +197,7 @@ stateDiagram-v2
 
 | 页面 | 功能 |
 | --- | --- |
-| 概览 | 每秒刷新运行状态；显示查询量、拦截量和拦截率；启动、停止、重启；开启/关闭过滤保护；预设或自定义时分秒暂停 |
+| 概览 | 每秒刷新运行状态；显示查询量、拦截量和拦截率；启动、停止、重启；开启/关闭过滤保护；预设或自定义时分秒暂停；暂停期间显示剩余时间通知 |
 | 查询 | 查看最近 DNS 查询、客户端、类型及拦截状态；清空查询日志；确认后为单个域名生成放行规则 |
 | 过滤 | 查看过滤订阅、规则数量及启用状态；新增订阅；更新全部过滤器 |
 | 设置 | 代理订阅兼容、主题、预测性返回手势、过滤器更新、缓存清理、系统 DNS、模块重启、紧急网络恢复、日志管理 |
@@ -244,6 +252,14 @@ IFW 会影响本项目目标过滤策略，因此模块采用明确的备份、�
 .
 ├── app/                         Android 管理器与 Gradle wrapper
 │   └── app/src/main/
+│       ├── AndroidManifest.xml  管理器组件、权限与前台服务声明
+│       ├── java/com/adguardhome/android/
+│       │   ├── ManagerActivity.kt
+│       │   ├── PauseCountdownService.java
+│       │   └── ui/              Compose 页面、主题与交互组件
+│       └── res/drawable/
+│           ├── ic_shield.xml
+│           └── ic_pause_timer.xml
 ├── module/                      Magisk / KernelSU 模块根目录
 │   ├── AdGuardHome.yaml         默认配置
 │   ├── customize.sh             安装、备份与 APK 安装
@@ -281,7 +297,7 @@ Set-Location F:\kaiyuan
 未显式设置环境变量时，脚本会尝试 `%LOCALAPPDATA%\Android\Sdk`。构建过程会：
 
 1. 使用 NDK 编译 ARM64 `aghbridge`；
-2. 通过 Gradle wrapper 执行 `clean assembleDebug lintDebug`；
+2. 通过 Gradle wrapper 分阶段执行 `clean assembleDebug` 和 `lintDebug`；
 3. 将管理器 APK 放入模块，保留 Unix 可执行权限后生成刷入 ZIP；
 4. 输出到 `dist/`。
 

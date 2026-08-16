@@ -1244,6 +1244,11 @@ public final class MainActivity extends Activity {
             protectionPauseUntilMs = !enabled && duration > 0
                     ? System.currentTimeMillis() + duration : 0L;
             persistPauseUntil();
+            if (protectionPauseUntilMs > 0L) {
+                PauseCountdownService.start(this, protectionPauseUntilMs);
+            } else {
+                PauseCountdownService.cancel(this);
+            }
             apiConnected = true;
             updateProtectionControls(true);
             scheduleOverviewRefresh(0);

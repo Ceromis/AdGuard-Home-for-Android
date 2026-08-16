@@ -32,7 +32,12 @@ if ($LASTEXITCODE -ne 0) {
 Push-Location $appRoot
 try {
     if (Test-Path -LiteralPath $gradle) {
-        & $gradle clean assembleDebug lintDebug --no-daemon
+        & $gradle clean assembleDebug --no-daemon
+        if ($LASTEXITCODE -eq 0) {
+            # Generate lint models in a fresh task graph. Recent AGP versions
+            # can lose the report model when clean, assemble and lint run together.
+            & $gradle lintDebug --no-daemon --rerun-tasks
+        }
     } else {
         throw 'Gradle wrapper not found. Run .\app\gradlew.bat once with network access.'
     }
@@ -49,7 +54,7 @@ $appApk = Join-Path $appRoot 'app\build\outputs\apk\debug\app-debug.apk'
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 Copy-Item $appApk (Join-Path $dist 'AdGuardHome-Android-debug.apk') -Force
 
-$zipPath = Join-Path $dist 'AdGuardHome-Android-v1.2.2-0.107.78.zip'
+$zipPath = Join-Path $dist 'AdGuardHome-Android-v1.2.4-0.107.78.zip'
 $python = @'
 import os
 import sys

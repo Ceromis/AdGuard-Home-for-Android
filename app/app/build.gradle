@@ -15,8 +15,8 @@ android {
         applicationId 'com.adguardhome.android'
         minSdk 33
         targetSdk 35
-    versionCode 37
-    versionName '1.2.2(0.107.78)'
+    versionCode 39
+    versionName '1.2.4(0.107.78)'
     }
     buildFeatures {
         compose true

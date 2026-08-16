@@ -74,7 +74,7 @@ watch_proxy_state() {
   while :; do
     result=$("$PROXY_CTL" watch 2>/dev/null) || result=
     case "$result" in
-      "active detected="*|restored)
+      "active detected="*)
         # A VPN network appearing or disappearing changes Android's active
         # netId.  Reinstall interception and rebind DNSResolver immediately
         # after the proxy configuration transaction has released its lock.
@@ -82,7 +82,7 @@ watch_proxy_state() {
           echo "$(date '+%Y-%m-%d %H:%M:%S') resolver refresh after proxy transition failed" >> "$DATA_DIR/logs/service.log"
         ;;
     esac
-    sleep 1
+    sleep 3
   done
 }
 

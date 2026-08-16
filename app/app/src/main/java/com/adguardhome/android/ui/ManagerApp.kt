@@ -1,6 +1,7 @@
 package com.adguardhome.android.ui
 
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.util.Base64
 import android.widget.Toast
@@ -52,6 +53,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalDensity
 import com.adguardhome.android.ApiClient
 import com.adguardhome.android.ModuleControlClient
+import com.adguardhome.android.PauseCountdownService
 import com.adguardhome.android.R
 import com.adguardhome.android.ui.liquid.lens
 import com.adguardhome.android.ui.liquid.vibrancy
@@ -466,7 +468,13 @@ private fun OverviewPage() {
                 durationMillis > 0L -> System.currentTimeMillis() + durationMillis
                 else -> Long.MAX_VALUE
             }
+            dashboard = dashboard.copy(protection = enabled, pauseUntil = pauseUntil)
             statePrefs.edit().putLong("pause_until", pauseUntil).apply()
+            if (!enabled && pauseUntil in 1 until Long.MAX_VALUE) {
+                PauseCountdownService.start(context, pauseUntil)
+            } else {
+                PauseCountdownService.cancel(context)
+            }
         }.onFailure { message = friendlyError(it) }
         reload()
     }
@@ -489,6 +497,7 @@ private fun OverviewPage() {
         if (dashboard.protection) {
             pauseUntil = 0L
             statePrefs.edit().putLong("pause_until", 0L).apply()
+            PauseCountdownService.cancel(context)
             return@LaunchedEffect
         }
         while (pauseUntil in 1 until Long.MAX_VALUE) {
@@ -999,6 +1008,13 @@ private fun DnsPage() {
 @Composable
 private fun AboutPage() {
     val context = LocalContext.current
+    val versionName = remember(context) {
+        context.packageManager
+            .getPackageInfo(context.packageName, PackageManager.PackageInfoFlags.of(0))
+            .versionName
+            ?.replace("(", " (")
+            .orEmpty()
+    }
     val control = remember { ModuleControlClient() }
     val scope = rememberCoroutineScope()
     var exporting by remember { mutableStateOf(false) }
@@ -1019,7 +1035,7 @@ private fun AboutPage() {
                     )
                 }
                 Text("AdGuard Home", style = MaterialTheme.typography.headlineSmall)
-                Text("1.2.2 (0.107.78)", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(versionName, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text("作者 Ceromis", style = MaterialTheme.typography.titleMedium)
             }
         }
@@ -1384,10 +1400,15 @@ private fun ProxySubscriptions() {
         }.onFailure { error = friendlyError(it); status = "代理兼容应用失败" }
     }
     LaunchedEffect(Unit) {
-        val subscriptions = withContext(Dispatchers.IO) { runCatching { requireControlSuccess(control.execute("proxy-subscription")) } }
+        val subscriptions = withContext(Dispatchers.IO) { runCatching {
+            val result = control.execute("proxy-subscription")
+            // Older module builds returned code 1 for a valid empty subscription list.
+            if (result.code != 0 && !(result.code == 1 && result.output.isBlank())) requireControlSuccess(result)
+            result.output
+        } }
         subscriptions.onSuccess {
             links.clear()
-            links.addAll(it.output.lines().map(String::trim).filter(::validUrl))
+            links.addAll(it.lines().map(String::trim).filter(::validUrl))
         }.onFailure { error = friendlyError(it) }
         val compat = withContext(Dispatchers.IO) { runCatching { requireControlSuccess(control.execute("proxy-status")) } }
         compat.onSuccess { status = it.output.trim().ifBlank { "代理兼容状态未知" } }

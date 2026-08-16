@@ -149,17 +149,25 @@ network_alert_ack() {
 }
 
 active_physical_network_state() {
-  local snapshot=/dev/.agh-network-watch.$$ netid block transport validated portal
+  local snapshot=/dev/.agh-network-watch.$$ netid flags transport validated portal
   dumpsys connectivity > "$snapshot" 2>/dev/null || { rm -f "$snapshot"; return 1; }
   netid=$(sed -n 's/^[[:space:]]*Active default network:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' "$snapshot" | head -n 1)
   case "$netid" in ''|*[!0-9]*) rm -f "$snapshot"; return 1 ;; esac
-  block=$(active_network_block "$snapshot" "$netid")
+  flags=$(active_network_block "$snapshot" "$netid" | awk '
+    /WIFI|TRANSPORT_WIFI/ { wifi=1 }
+    /CELLULAR|TRANSPORT_CELLULAR/ { cellular=1 }
+    /IS_VALIDATED|&VALIDATED([& ]|$)/ { validated=1 }
+    /IS_CAPTIVE_PORTAL|CAPTIVE_PORTAL|PARTIAL_CONNECTIVITY/ { portal=1 }
+    END {
+      if (wifi) transport="wifi"
+      else if (cellular) transport="cellular"
+      if (transport != "") print transport, validated + 0, portal + 0
+    }
+  ')
   rm -f "$snapshot"
-  printf '%s\n' "$block" | grep -qE 'WIFI|TRANSPORT_WIFI' && transport=wifi
-  [ -n "$transport" ] || { printf '%s\n' "$block" | grep -qE 'CELLULAR|TRANSPORT_CELLULAR' && transport=cellular; }
-  [ -n "$transport" ] || return 1
-  printf '%s\n' "$block" | grep -qE 'IS_VALIDATED|&VALIDATED([& ]|$)' && validated=1 || validated=0
-  printf '%s\n' "$block" | grep -qE 'IS_CAPTIVE_PORTAL|CAPTIVE_PORTAL|PARTIAL_CONNECTIVITY' && portal=1 || portal=0
+  [ -n "$flags" ] || return 1
+  set -- $flags
+  transport=$1 validated=$2 portal=$3
   echo "$netid $transport $validated $portal"
 }
 
@@ -495,31 +503,18 @@ dns_probe_blocked() {
 }
 
 resolver_filtering_healthy() {
-  local slot host
-  slot=$(date +%s 2>/dev/null)
-  case "$slot" in ''|*[!0-9]*) slot=0 ;; esac
-  slot=$((slot / 10 % 4))
-  case "$slot" in
-    0) host=googleads.g.doubleclick.net ;;
-    1) host=adservice.google.com ;;
-    2) host=securepubads.g.doubleclick.net ;;
-    *) host=pagead2.googlesyndication.com ;;
-  esac
-  # A failed resolver also makes blocked hosts unresolvable.  Prove that the
-  # ordinary DNS path works before treating an unresolved ad host as filtering.
+  # Resolver health is independent from filtering protection.  In particular,
+  # a timed protection pause intentionally resolves ad hosts and must not be
+  # interpreted as takeover loss.
   dns_probe_host example.com &&
-    dns_probe_host www.iana.org &&
-    dns_probe_blocked "$host"
+    dns_probe_host www.iana.org
 }
 
 system_dns_probe() {
-  # Connectivity alone is not proof that Android accepted localhost: netd can
-  # silently retain or restore the network DNS.  Require ordinary names to
-  # resolve and known, publicly resolvable ad names to be blocked by AGH.
+  # Keep this probe about resolver availability only.  Filtering can be
+  # intentionally disabled or paused while the local DNS path remains valid.
   dns_probe_host example.com &&
-    dns_probe_host www.iana.org &&
-    dns_probe_blocked googleads.g.doubleclick.net &&
-    dns_probe_blocked adservice.google.com
+    dns_probe_host www.iana.org
 }
 
 resolver_restore() {
@@ -548,11 +543,10 @@ verify_restored_dns() {
 
 network_is_wifi() {
   local snapshot=${1:-/dev/.agh-connectivity-check.$$}
-  local netid block
+  local netid
   connectivity_snapshot "$snapshot" || return 1
   netid=$(active_network_id "$snapshot") || { rm -f "$snapshot"; return 1; }
-  block=$(active_network_block "$snapshot" "$netid")
-  printf '%s\n' "$block" | grep -qE 'WIFI|TRANSPORT_WIFI'
+  active_network_block "$snapshot" "$netid" | grep -qE 'WIFI|TRANSPORT_WIFI'
   local result=$?
   rm -f "$snapshot"
   return "$result"
@@ -574,6 +568,11 @@ resolver_takeover() {
     log "local DNS is not listening; resolver takeover skipped"
     return 1
   }
+  if resolver_blocked_for "$netid"; then
+    rm -f "$snapshot"
+    log "resolver takeover skipped after a failed verification for netid=$netid"
+    return 2
+  fi
   if [ -s "$RESOLVER_STATE" ]; then
     boot=$(current_boot_id)
     saved_boot=$(state_boot_id)
@@ -620,6 +619,14 @@ resolver_takeover() {
   # validation probes, then silently fall back to the network's IPv6 DNS.
   # IPv4 loopback is supported consistently and still reaches the dual-stack
   # AdGuard Home listener.
+  # Persist the rollback requirement before touching IDnsResolver.  A failed
+  # verification must restore the saved servers too; marking only after the
+  # probe leaves localhost installed when stop() kills the local resolver.
+  if ! resolver_mark_active; then
+    log "could not persist resolver rollback state for netid=$netid"
+    resolver_restore >/dev/null 2>&1 || :
+    return 1
+  fi
   if ! resolver_call "$netid" 127.0.0.1; then
     log "DNSResolver takeover failed for netid=$netid"
     if resolver_restore; then
@@ -629,10 +636,6 @@ resolver_takeover() {
   fi
   sleep 1
   if system_dns_probe; then
-    resolver_mark_active || {
-      resolver_restore
-      return 1
-    }
     rm -f "$RESOLVER_BLOCKED"
     resolver_mark_healthy "$netid" >/dev/null 2>&1 || :
     log "DNSResolver netid=$netid -> 127.0.0.1 (verified)"
@@ -1312,7 +1315,10 @@ case "$1" in
   network-alert) network_alert ;;
   network-alert-ack) network_alert_ack ;;
   network-watch) network_watch ;;
-  cleanup) stop_app_cleaner; proxy_control suspend >/dev/null 2>&1; resolver_restore; result=$?; remove_iptables_rules; echo rules-removed; exit "$result" ;;
+  # cleanup is the supervisor's pre-start transaction.  Restoring proxy
+  # configuration here causes a restore/re-apply restart loop.  Explicit
+  # stop, recover, proxy-disable and uninstall still restore it.
+  cleanup) stop_app_cleaner; resolver_restore; result=$?; remove_iptables_rules; echo rules-removed; exit "$result" ;;
   recover) stop ;;
   resolver-sync) resolver_sync ;;
   sync) sync_all ;;

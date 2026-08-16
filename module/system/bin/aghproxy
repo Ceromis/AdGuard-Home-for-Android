@@ -11,6 +11,10 @@ SUBSCRIPTION_FILE=$STATE_DIR/subscription.url
 RELOAD_STATE_DIR=$STATE_DIR/reloaded
 CONTROL_LOCK=$DATA_DIR/proxy-compat.lock
 LOCAL_DNS=127.0.0.1:5353
+BOX_BLL_ROOT=${AGH_BOX_BLL_ROOT:-/data/adb/box_bll}
+BOX_ROOT=${AGH_BOX_ROOT:-/data/adb/box}
+CLASH_ROOT=${AGH_CLASH_ROOT:-/data/clash}
+CLASH_MODULE_ROOT=${AGH_CLASH_MODULE_ROOT:-/data/adb/modules/Clash}
 HELPER_APK=
 APP_PROCESS=
 CHANGED_BOX_BLL=0
@@ -221,33 +225,93 @@ process_manual_paths() {
 }
 
 restart_changed() {
-  if [ "$CHANGED_BOX_BLL" = 1 ] && [ -x /data/adb/box_bll/scripts/box.service ]; then
-    /data/adb/box_bll/scripts/box.service restart >> "$LOG_FILE" 2>&1 || log "box_bll restart failed"
+  if [ "$CHANGED_BOX_BLL" = 1 ] && [ -x "$BOX_BLL_ROOT/scripts/box.service" ]; then
+    "$BOX_BLL_ROOT/scripts/box.service" restart >> "$LOG_FILE" 2>&1 || log "box_bll restart failed"
   fi
-  if [ "$CHANGED_BOX" = 1 ] && [ -x /data/adb/box/scripts/box.service ]; then
-    /data/adb/box/scripts/box.service restart >> "$LOG_FILE" 2>&1 || log "box restart failed"
+  if [ "$CHANGED_BOX" = 1 ] && [ -x "$BOX_ROOT/scripts/box.service" ]; then
+    "$BOX_ROOT/scripts/box.service" restart >> "$LOG_FILE" 2>&1 || log "box restart failed"
   fi
-  if [ "$CHANGED_CLASH" = 1 ] && [ -x /data/clash/scripts/clash.service ]; then
-    /data/clash/scripts/clash.service -k >> "$LOG_FILE" 2>&1
-    /data/clash/scripts/clash.service -s >> "$LOG_FILE" 2>&1 || log "clash service restart failed"
+  if [ "$CHANGED_CLASH" = 1 ] && [ -x "$CLASH_ROOT/scripts/clash.service" ]; then
+    "$CLASH_ROOT/scripts/clash.service" -k >> "$LOG_FILE" 2>&1
+    "$CLASH_ROOT/scripts/clash.service" -s >> "$LOG_FILE" 2>&1 || log "clash service restart failed"
   fi
-  if [ "$CHANGED_CLASH_MODULE" = 1 ] && [ -x /data/adb/modules/Clash/Scripts/Clash.Service ]; then
-    /data/adb/modules/Clash/Scripts/Clash.Service stop >> "$LOG_FILE" 2>&1
-    /data/adb/modules/Clash/Scripts/Clash.Service start >> "$LOG_FILE" 2>&1 || log "Clash module restart failed"
+  if [ "$CHANGED_CLASH_MODULE" = 1 ] && [ -x "$CLASH_MODULE_ROOT/Scripts/Clash.Service" ]; then
+    "$CLASH_MODULE_ROOT/Scripts/Clash.Service" stop >> "$LOG_FILE" 2>&1
+    "$CLASH_MODULE_ROOT/Scripts/Clash.Service" start >> "$LOG_FILE" 2>&1 || log "Clash module restart failed"
   fi
+}
+
+box_setting() {
+  local settings=$1 key=$2 value
+  [ -f "$settings" ] || return 1
+  value=$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$settings" 2>/dev/null | head -n 1)
+  [ -n "$value" ] || return 1
+  case "$value" in
+    \"*\") value=${value#\"}; value=${value%%\"*} ;;
+    \'*\') value=${value#\'}; value=${value%%\'*} ;;
+    *) value=${value%%[[:space:]#]*} ;;
+  esac
+  [ -n "$value" ] || return 1
+  printf '%s\n' "$value"
+}
+
+box_core_running() {
+  local root=$1 settings=$1/settings.ini pid_file bin_path bin_name pid
+  bin_name=$(box_setting "$settings" bin_name 2>/dev/null) || return 1
+  pid_file=$root/run/box.pid
+  bin_path=$root/bin/$bin_name
+  pid=$(cat "$pid_file" 2>/dev/null)
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -n "$bin_path" ] && [ -r "/proc/$pid/cmdline" ]; then
+    tr '\000' ' ' < "/proc/$pid/cmdline" | grep -F "$bin_path" >/dev/null 2>&1 && return 0
+  fi
+  [ -z "$bin_name" ] || [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "$bin_name" ]
 }
 
 group_running() {
   case "$1" in
-    box_bll) pgrep -f '/data/adb/box_bll/' >/dev/null 2>&1 ;;
-    box) pgrep -f '/data/adb/box/' >/dev/null 2>&1 ;;
-    clash) pgrep -f '/data/clash/' >/dev/null 2>&1 ;;
-    clash_module) pgrep -f '/data/adb/modules/Clash/' >/dev/null 2>&1 ;;
+    box_bll) box_core_running "$BOX_BLL_ROOT" ;;
+    box) box_core_running "$BOX_ROOT" ;;
+    clash) pgrep -f "$CLASH_ROOT/" >/dev/null 2>&1 ;;
+    clash_module) pgrep -f "$CLASH_MODULE_ROOT/" >/dev/null 2>&1 ;;
     cmfa_alpha) pgrep -f 'com.github.metacubex.clash.alpha' >/dev/null 2>&1 ;;
     cmfa_meta) pgrep -f 'com.github.metacubex.clash.meta' >/dev/null 2>&1 ;;
     clash_android) pgrep -f 'com.github.kr328.clash' >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
+}
+
+box_config_path() {
+  local root=$1 settings=$1/settings.ini
+  [ -f "$settings" ] || return 1
+  local bin_name config_name
+  bin_name=$(box_setting "$settings" bin_name 2>/dev/null) || return 1
+  case "$bin_name" in
+    mihomo)
+      config_name=$(box_setting "$settings" name_mihomo_config 2>/dev/null) || config_name=config.yaml
+      printf '%s/mihomo/%s\n' "$root" "$config_name"
+      ;;
+    clash)
+      config_name=$(box_setting "$settings" name_clash_config 2>/dev/null) || config_name=config.yaml
+      printf '%s/clash/%s\n' "$root" "$config_name"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+process_box_root() {
+  local group=$1 root=$2 configured pattern
+  configured=$(box_config_path "$root" 2>/dev/null)
+  [ -z "$configured" ] || apply_one "$configured" "$group" auto
+  for pattern in "$root"/mihomo/*.yaml "$root"/mihomo/*.yml \
+      "$root"/clash/*.yaml "$root"/clash/*.yml; do
+    [ -f "$pattern" ] || continue
+    [ "$pattern" = "$configured" ] && continue
+    apply_one "$pattern" "$group" auto
+  done
 }
 
 android_vpn_running() {
@@ -290,6 +354,24 @@ active_proxy_groups() {
   for group in box_bll box clash clash_module cmfa_alpha cmfa_meta clash_android; do
     proxy_group_active "$group" && echo "$group"
   done
+}
+
+config_candidates_available() {
+  local file source group path tab
+  for file in "$BOX_BLL_ROOT"/mihomo/*.yaml "$BOX_BLL_ROOT"/mihomo/*.yml \
+      "$BOX_BLL_ROOT"/clash/*.yaml "$BOX_BLL_ROOT"/clash/*.yml \
+      "$BOX_ROOT"/mihomo/*.yaml "$BOX_ROOT"/mihomo/*.yml \
+      "$BOX_ROOT"/clash/*.yaml "$BOX_ROOT"/clash/*.yml \
+      "$CLASH_ROOT"/*.yaml "$CLASH_ROOT"/*.yml \
+      /data/media/0/Android/Clash/*.yaml /data/media/0/Android/Clash/*.yml; do
+    [ -f "$file" ] && return 0
+  done
+  [ -f "$PATHS_FILE" ] || return 1
+  tab=$(printf '\t')
+  while IFS="$tab" read -r source group path; do
+    [ "$source" = manual ] && { [ -f "$path" ] || [ -d "$path" ]; } && return 0
+  done < "$PATHS_FILE"
+  return 1
 }
 
 android_package() {
@@ -348,31 +430,20 @@ sync_configs() {
   local active_groups
   [ -f "$ENABLED_FILE" ] || { echo disabled; return 0; }
   active_groups=$(active_proxy_groups)
-  if [ -z "$active_groups" ]; then
-    if [ -f "$ACTIVE_FILE" ] || [ -d "$STATE_DIR/state" ]; then
-      restore_configs >/dev/null || return 1
-      rm -f "$ACTIVE_FILE"
-      rm -rf "$RELOAD_STATE_DIR"
-      log "proxy stopped; restored normal filtering configuration"
-    fi
+  if [ -z "$active_groups" ] && ! config_candidates_available; then
+    rm -f "$ACTIVE_FILE"
     echo 0 > "$STATE_DIR/detected"
     echo waiting-for-proxy
     return 0
   fi
   editor_helper || { log "proxy compatibility helper is unavailable"; echo helper-unavailable; return 1; }
   DETECTED=0
-  proxy_group_active box_bll && process_pattern box_bll '/data/adb/box_bll/clash/*.yaml'
-  proxy_group_active box_bll && process_pattern box_bll '/data/adb/box_bll/clash/*.yml'
-  proxy_group_active box_bll && process_pattern box_bll '/data/adb/box_bll/mihomo/*.yaml'
-  proxy_group_active box_bll && process_pattern box_bll '/data/adb/box_bll/mihomo/*.yml'
-  proxy_group_active box && process_pattern box '/data/adb/box/clash/*.yaml'
-  proxy_group_active box && process_pattern box '/data/adb/box/clash/*.yml'
-  proxy_group_active box && process_pattern box '/data/adb/box/mihomo/*.yaml'
-  proxy_group_active box && process_pattern box '/data/adb/box/mihomo/*.yml'
-  proxy_group_active clash && process_pattern clash '/data/clash/*.yaml'
-  proxy_group_active clash && process_pattern clash '/data/clash/*.yml'
-  proxy_group_active clash_module && process_pattern clash_module '/data/media/0/Android/Clash/*.yaml'
-  proxy_group_active clash_module && process_pattern clash_module '/data/media/0/Android/Clash/*.yml'
+  process_box_root box_bll "$BOX_BLL_ROOT"
+  process_box_root box "$BOX_ROOT"
+  process_pattern clash "$CLASH_ROOT/*.yaml"
+  process_pattern clash "$CLASH_ROOT/*.yml"
+  process_pattern clash_module '/data/media/0/Android/Clash/*.yaml'
+  process_pattern clash_module '/data/media/0/Android/Clash/*.yml'
   proxy_group_active cmfa_alpha && process_pattern cmfa_alpha '/data/user/0/com.github.metacubex.clash.alpha/files/imported/*/config.yaml'
   proxy_group_active cmfa_meta && process_pattern cmfa_meta '/data/user/0/com.github.metacubex.clash.meta/files/imported/*/config.yaml'
   proxy_group_active clash_android && process_pattern clash_android '/data/user/0/com.github.kr328.clash/files/imported/*/config.yaml'
@@ -380,10 +451,13 @@ sync_configs() {
   echo "$DETECTED" > "$STATE_DIR/detected"
   chmod 600 "$STATE_DIR/detected" 2>/dev/null
   restart_changed
-  if [ "$DETECTED" -gt 0 ]; then
+  if [ "$DETECTED" -gt 0 ] && [ -n "$active_groups" ]; then
     printf '%s\n' "$active_groups" > "$ACTIVE_FILE"
     chmod 600 "$ACTIVE_FILE"
     echo "active detected=$DETECTED"
+  elif [ "$DETECTED" -gt 0 ]; then
+    rm -f "$ACTIVE_FILE"
+    echo "waiting detected=$DETECTED"
   else
     rm -f "$ACTIVE_FILE"
     echo no-supported-config
@@ -396,13 +470,10 @@ watch_compat() {
   active_groups=$(active_proxy_groups)
   previous=$(cat "$ACTIVE_FILE" 2>/dev/null)
   if [ -z "$active_groups" ]; then
-    if [ -n "$previous" ] || [ -d "$STATE_DIR/state" ]; then
-      suspend_compat >/dev/null || return 1
-      log "proxy stopped; normal filtering restored"
-      echo restored
-    else
-      echo waiting-for-proxy
-    fi
+    # Preserve adapted files across transient proxy restarts.  Explicit
+    # disable/stop still calls restore_configs through suspend_compat.
+    rm -f "$ACTIVE_FILE"
+    echo waiting-for-proxy
     return 0
   fi
   if [ "$active_groups" != "$previous" ]; then
@@ -454,11 +525,6 @@ restore_configs() {
 }
 
 enable_compat() {
-  if [ ! -s "$SUBSCRIPTION_FILE" ]; then
-    echo subscription-required
-    log "proxy compatibility enable refused because subscription URL is not configured"
-    return 2
-  fi
   mkdir -p "$STATE_DIR" || return 1
   : > "$ENABLED_FILE"
   chmod 600 "$ENABLED_FILE"
@@ -639,7 +705,8 @@ delete_subscription() {
 }
 
 show_subscription() {
-  [ -s "$SUBSCRIPTION_FILE" ] && cat "$SUBSCRIPTION_FILE"
+  [ -s "$SUBSCRIPTION_FILE" ] || return 0
+  cat "$SUBSCRIPTION_FILE"
 }
 
 status_compat() {
