@@ -1,5 +1,7 @@
 # AdGuard Home for Android
 
+事先说明，该模块与https://github.com/liuzq2002/Adguard-Home-For-Magisk-Mod项目无关，拉取文件注意区分
+
 一个面向 `arm64-v8a` Android 设备的本地 DNS 过滤方案。项目将 AdGuard Home 作为 Magisk / KernelSU 模块中的常驻 DNS 服务运行，并提供原生 Android 管理器、受限特权控制桥、系统 DNS 接管、代理兼容、网络故障保护和完整恢复机制。
 
 ## 项目特点
