@@ -1,0 +1,13 @@
+package com.adguardhome.android;
+
+/**
+ * Build-time injected constants.  The template is populated by build.ps1 on
+ * every release so that the bridge token never lives in source control.  Do
+ * not edit the generated file by hand; rerun the build to refresh it.
+ */
+final class BuildConstants {
+    static final String BRIDGE_TOKEN = "TOKEN_PLACEHOLDER";
+
+    private BuildConstants() {
+    }
+}

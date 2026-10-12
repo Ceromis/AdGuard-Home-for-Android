@@ -23,22 +23,38 @@ CHANGED_CLASH=0
 CHANGED_CLASH_MODULE=0
 DETECTED=0
 
+portable_date() {
+  if [ -x /system/bin/toybox ]; then
+    /system/bin/toybox date "$@"
+  else
+    date "$@"
+  fi
+}
+
+portable_sleep() {
+  if [ -x /system/bin/toybox ]; then
+    /system/bin/toybox sleep "$@"
+  else
+    sleep "$@"
+  fi
+}
+
 log() {
   mkdir -p "${LOG_FILE%/*}" 2>/dev/null
-  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
+  echo "$(portable_date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
 }
 
 acquire_proxy_lock() {
   local waited=0 owner
   mkdir -p "$DATA_DIR" "$STATE_DIR" 2>/dev/null || return 1
   while ! mkdir "$CONTROL_LOCK" 2>/dev/null; do
-    owner=$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$CONTROL_LOCK/owner" 2>/dev/null | head -n 1)
+    owner=$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$CONTROL_LOCK/owner" 2>/dev/null | sed -n '1p')
     if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
       rm -rf "$CONTROL_LOCK" 2>/dev/null
       continue
     fi
     [ "$waited" -ge 15 ] && { log "proxy action busy; refusing overlap: $1"; return 75; }
-    sleep 1
+    portable_sleep 1
     waited=$((waited + 1))
   done
   echo "pid=$$ action=$1" > "$CONTROL_LOCK/owner"
@@ -54,7 +70,7 @@ editor_helper() {
   if [ -f "$bundled" ]; then
     HELPER_APK=$bundled
   else
-    HELPER_APK=$(pm path com.adguardhome.android 2>/dev/null | sed -n 's/^package://p' | head -n 1)
+    HELPER_APK=$(pm path com.adguardhome.android 2>/dev/null | sed -n 's/^package://p' | sed -n '1p')
   fi
   [ -n "$HELPER_APK" ] && [ -f "$HELPER_APK" ] || return 1
   if [ -x /system/bin/app_process64 ]; then
@@ -167,7 +183,7 @@ apply_one() {
   backup=$STATE_DIR/backups/$key.yaml
   meta=$STATE_DIR/state/$key.state
   current=$(hash_file "$file") || return 1
-  previous_patched=$(sed -n 's/^patched=//p' "$meta" 2>/dev/null | head -n 1)
+  previous_patched=$(sed -n 's/^patched=//p' "$meta" 2>/dev/null | sed -n '1p')
   if [ ! -f "$backup" ] || [ -z "$previous_patched" ] || [ "$current" != "$previous_patched" ]; then
     cp -p "$file" "$backup.tmp.$$" || return 1
     mv "$backup.tmp.$$" "$backup" || return 1
@@ -244,7 +260,7 @@ restart_changed() {
 box_setting() {
   local settings=$1 key=$2 value
   [ -f "$settings" ] || return 1
-  value=$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$settings" 2>/dev/null | head -n 1)
+  value=$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$settings" 2>/dev/null | sed -n '1p')
   [ -n "$value" ] || return 1
   case "$value" in
     \"*\") value=${value#\"}; value=${value%%\"*} ;;
@@ -317,7 +333,7 @@ process_box_root() {
 android_vpn_running() {
   local package=$1 uid
   pgrep -f "$package" >/dev/null 2>&1 || return 1
-  uid=$(pm list packages -U "$package" 2>/dev/null | sed -n 's/.* uid:\([0-9][0-9]*\).*/\1/p' | head -n 1)
+  uid=$(pm list packages -U "$package" 2>/dev/null | sed -n 's/.* uid:\([0-9][0-9]*\).*/\1/p' | sed -n '1p')
   case "$uid" in ''|*[!0-9]*) return 1 ;; esac
   # Inspect actual network agents only.  Connectivity callback registrations
   # contain both the package name and "Transports: VPN" even while the VPN is
@@ -489,10 +505,10 @@ restore_configs() {
   [ -d "$STATE_DIR/state" ] || { echo restored=0; return 0; }
   for meta in "$STATE_DIR"/state/*.state; do
     [ -f "$meta" ] || continue
-    path=$(sed -n 's/^path=//p' "$meta" | head -n 1)
-    backup=$(sed -n 's/^backup=//p' "$meta" | head -n 1)
-    patched=$(sed -n 's/^patched=//p' "$meta" | head -n 1)
-    group=$(sed -n 's/^group=//p' "$meta" | head -n 1)
+    path=$(sed -n 's/^path=//p' "$meta" | sed -n '1p')
+    backup=$(sed -n 's/^backup=//p' "$meta" | sed -n '1p')
+    patched=$(sed -n 's/^patched=//p' "$meta" | sed -n '1p')
+    group=$(sed -n 's/^group=//p' "$meta" | sed -n '1p')
     if [ ! -f "$path" ] || [ ! -f "$backup" ]; then
       skipped=$((skipped + 1))
       continue
@@ -589,11 +605,11 @@ restore_registered_path() {
   [ -d "$STATE_DIR/state" ] || return 0
   for meta in "$STATE_DIR"/state/*.state; do
     [ -f "$meta" ] || continue
-    path=$(sed -n 's/^path=//p' "$meta" | head -n 1)
+    path=$(sed -n 's/^path=//p' "$meta" | sed -n '1p')
     case "$path" in "$wanted"|"$wanted"/*) ;; *) continue ;; esac
-    backup=$(sed -n 's/^backup=//p' "$meta" | head -n 1)
-    patched=$(sed -n 's/^patched=//p' "$meta" | head -n 1)
-    group=$(sed -n 's/^group=//p' "$meta" | head -n 1)
+    backup=$(sed -n 's/^backup=//p' "$meta" | sed -n '1p')
+    patched=$(sed -n 's/^patched=//p' "$meta" | sed -n '1p')
+    group=$(sed -n 's/^group=//p' "$meta" | sed -n '1p')
     current=$(hash_file "$path")
     if [ -f "$backup" ] && [ -n "$patched" ] && [ "$current" = "$patched" ]; then
       ownership=$(stat -c '%u:%g' "$path" 2>/dev/null)

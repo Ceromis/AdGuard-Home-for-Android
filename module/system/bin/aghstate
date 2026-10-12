@@ -1,0 +1,189 @@
+#!/system/bin/sh
+# ==============================================================================
+# AdGuard Home for Android - 统一运行时状态 (adgyaml)
+# ==============================================================================
+# aghctl / service.sh / aghappclean / customize.sh 共用这份实现。
+# 运行期的 pid、禁用标记、DNS 接管、浏览器重置、私有 DNS 备份等全部写进
+# 一个 $DATA_DIR/adgyaml,根目录不再散落 agh.pid / resolver.* 等小文件。
+# 格式: 每行 "key: value",value 不含换行。
+# ==============================================================================
+
+DATA_DIR=${AGH_DATA_DIR:-/data/adb/agh}
+STATE_FILE=${AGH_STATE_FILE:-$DATA_DIR/adgyaml}
+STATE_VERSION=2
+
+state_get() {
+  [ -f "$STATE_FILE" ] || return 1
+  awk -v key="$1" '
+    index($0, key ":") == 1 { line = $0; sub(/^[^:]*:[ ]*/, "", line); print line; exit }
+  ' "$STATE_FILE" 2>/dev/null
+}
+
+# 状态读改写必须串行,否则并发写会互相覆盖字段(pid 丢失会留下孤儿进程)。
+state_lock() {
+  local waited=0
+  mkdir -p "$DATA_DIR/work" 2>/dev/null
+  while ! mkdir "$DATA_DIR/work/.state.lock" 2>/dev/null; do
+    waited=$((waited + 1))
+    if [ "$waited" -ge 50 ]; then
+      rm -rf "$DATA_DIR/work/.state.lock" 2>/dev/null
+      mkdir "$DATA_DIR/work/.state.lock" 2>/dev/null && return 0
+      return 1
+    fi
+    sleep 0.1 2>/dev/null || sleep 1
+  done
+  return 0
+}
+
+state_unlock() {
+  rmdir "$DATA_DIR/work/.state.lock" 2>/dev/null || :
+}
+
+state_write() {
+  local key=$1 value=$2 temp=$STATE_FILE.set.$$
+  [ -f "$STATE_FILE" ] || return 1
+  state_lock || return 1
+  awk -v key="$key" -v value="$value" '
+    index($0, key ":") == 1 { print key ": " value; updated = 1; next }
+    { print }
+    END { if (!updated) print key ": " value }
+  ' "$STATE_FILE" > "$temp" 2>/dev/null || { rm -f "$temp"; state_unlock; return 1; }
+  chmod 600 "$temp" 2>/dev/null || :
+  mv "$temp" "$STATE_FILE" || { rm -f "$temp"; state_unlock; return 1; }
+  state_unlock
+  return 0
+}
+
+state_defaults() {
+  mkdir -p "$DATA_DIR" || return 1
+  {
+    echo 'version: 2'
+    echo 'pid: 0'
+    echo 'bridge_pid: 0'
+    echo 'appclean_pid: 0'
+    echo 'status: stopped'
+    echo 'http_port: 3000'
+    echo 'dns_port: 5353'
+    echo 'disabled_boot_id:'
+    echo 'ssl_cert_file:'
+    echo 'browser_reset_boot_id:'
+    echo 'private_dns_saved: 0'
+    echo 'private_dns_mode:'
+    echo 'private_dns_specifier:'
+    echo 'resolver_boot_id:'
+    echo 'resolver_netid:'
+    echo 'resolver_dns:'
+    echo 'resolver_active:'
+    echo 'resolver_blocked:'
+    echo 'resolver_health_boot_id:'
+    echo 'resolver_health_netid:'
+    echo 'resolver_health_checked_at:'
+    echo 'iptables_fallback_netid:'
+    echo 'iptables_fallback_started:'
+    echo 'network_alert:'
+  } > "$STATE_FILE.tmp.$$" || return 1
+  chmod 600 "$STATE_FILE.tmp.$$" 2>/dev/null || :
+  mv "$STATE_FILE.tmp.$$" "$STATE_FILE" || { rm -f "$STATE_FILE.tmp.$$"; return 1; }
+  return 0
+}
+
+# 把旧版散落的小文件一次性并入 adgyaml,然后删除旧文件。
+state_migrate() {
+  local v file dns pair
+  v=$(awk 'index($0, "version:") == 1 { sub(/^[^:]*:[ ]*/, "", $0); print; exit }' "$STATE_FILE" 2>/dev/null)
+  local legacy=0
+  for file in agh.pid aghbridge.pid appclean.pid agh.launch disabled \
+              browser-reset.boot private-dns.state resolver.state resolver.blocked \
+              resolver.health iptables-fallback network-alert cacerts.pem; do
+    if [ -e "$DATA_DIR/$file" ]; then
+      legacy=1
+      break
+    fi
+  done
+  [ "$v" = "$STATE_VERSION" ] && [ "$legacy" -eq 0 ] && return 0
+
+  if [ -s "$DATA_DIR/agh.pid" ]; then
+    state_write pid "$(head -n 1 "$DATA_DIR/agh.pid" 2>/dev/null)"
+  fi
+  if [ -s "$DATA_DIR/aghbridge.pid" ]; then
+    state_write bridge_pid "$(head -n 1 "$DATA_DIR/aghbridge.pid" 2>/dev/null)"
+  fi
+  if [ -s "$DATA_DIR/appclean.pid" ]; then
+    state_write appclean_pid "$(head -n 1 "$DATA_DIR/appclean.pid" 2>/dev/null)"
+  fi
+  if [ -s "$DATA_DIR/agh.launch" ]; then
+    state_write ssl_cert_file "$(sed -n 's/^ssl_cert_file=//p' "$DATA_DIR/agh.launch" 2>/dev/null | head -n 1)"
+  fi
+  if [ -s "$DATA_DIR/disabled" ]; then
+    state_write disabled_boot_id "$(cat "$DATA_DIR/disabled" 2>/dev/null)"
+  fi
+  if [ -s "$DATA_DIR/browser-reset.boot" ]; then
+    state_write browser_reset_boot_id "$(cat "$DATA_DIR/browser-reset.boot" 2>/dev/null)"
+  fi
+  if [ -s "$DATA_DIR/private-dns.state" ]; then
+    state_write private_dns_mode "$(sed -n 's/^mode=//p' "$DATA_DIR/private-dns.state" 2>/dev/null | head -n 1)"
+    state_write private_dns_specifier "$(sed -n 's/^specifier=//p' "$DATA_DIR/private-dns.state" 2>/dev/null | head -n 1)"
+    state_write private_dns_saved 1
+  fi
+  if [ -s "$DATA_DIR/resolver.state" ]; then
+    state_write resolver_boot_id "$(sed -n 's/^boot_id=//p' "$DATA_DIR/resolver.state" 2>/dev/null | head -n 1)"
+    state_write resolver_netid "$(sed -n 's/^netid=//p' "$DATA_DIR/resolver.state" 2>/dev/null | head -n 1)"
+    state_write resolver_active "$(sed -n 's/^active=//p' "$DATA_DIR/resolver.state" 2>/dev/null | tail -n 1)"
+    dns=$(sed -n 's/^dns=//p' "$DATA_DIR/resolver.state" 2>/dev/null | tr '\n' '|')
+    dns=$(printf '%s' "$dns" | sed 's/|*$//')
+    [ -n "$dns" ] && state_write resolver_dns "$dns"
+  fi
+  if [ -s "$DATA_DIR/resolver.blocked" ]; then
+    pair="$(sed -n 's/^boot_id=//p' "$DATA_DIR/resolver.blocked" 2>/dev/null | head -n 1)|$(sed -n 's/^netid=//p' "$DATA_DIR/resolver.blocked" 2>/dev/null | head -n 1)"
+    state_write resolver_blocked "$pair"
+  fi
+  if [ -s "$DATA_DIR/resolver.health" ]; then
+    state_write resolver_health_boot_id "$(sed -n 's/^boot_id=//p' "$DATA_DIR/resolver.health" 2>/dev/null | head -n 1)"
+    state_write resolver_health_netid "$(sed -n 's/^netid=//p' "$DATA_DIR/resolver.health" 2>/dev/null | head -n 1)"
+    state_write resolver_health_checked_at "$(sed -n 's/^checked_at=//p' "$DATA_DIR/resolver.health" 2>/dev/null | head -n 1)"
+  fi
+  if [ -s "$DATA_DIR/iptables-fallback" ]; then
+    state_write iptables_fallback_netid "$(sed -n 's/^netid=//p' "$DATA_DIR/iptables-fallback" 2>/dev/null | head -n 1)"
+    state_write iptables_fallback_started "$(sed -n 's/^started=//p' "$DATA_DIR/iptables-fallback" 2>/dev/null | head -n 1)"
+  fi
+  if [ -s "$DATA_DIR/network-alert" ]; then
+    state_write network_alert active
+  fi
+  if [ -s "$DATA_DIR/cacerts.pem" ]; then
+    mkdir -p "$DATA_DIR/work" 2>/dev/null
+    mv -f "$DATA_DIR/cacerts.pem" "$DATA_DIR/work/cacerts.pem" 2>/dev/null || :
+  fi
+  case "$(state_get ssl_cert_file)" in
+    "$DATA_DIR/cacerts.pem") state_write ssl_cert_file "$DATA_DIR/work/cacerts.pem" ;;
+  esac
+  # 运行配置只保留一个回滚备份。
+  if [ ! -e "$DATA_DIR/AdGuardHome.yaml.bak" ]; then
+    for file in before-port-migration before-rule-repair before-default-filter-migration; do
+      if [ -s "$DATA_DIR/AdGuardHome.yaml.$file" ]; then
+        cp -f "$DATA_DIR/AdGuardHome.yaml.$file" "$DATA_DIR/AdGuardHome.yaml.bak" 2>/dev/null
+        break
+      fi
+    done
+  fi
+  rm -f "$DATA_DIR"/AdGuardHome.yaml.before-* 2>/dev/null
+  rm -f "$DATA_DIR/agh.pid" "$DATA_DIR/aghbridge.pid" "$DATA_DIR/appclean.pid" \
+        "$DATA_DIR/agh.launch" "$DATA_DIR/disabled" "$DATA_DIR/browser-reset.boot" \
+        "$DATA_DIR/private-dns.state" "$DATA_DIR/resolver.state" \
+        "$DATA_DIR/resolver.blocked" "$DATA_DIR/resolver.health" \
+        "$DATA_DIR/iptables-fallback" "$DATA_DIR/network-alert" 2>/dev/null
+  state_write version "$STATE_VERSION"
+  return 0
+}
+
+state_init() {
+  if [ ! -f "$STATE_FILE" ]; then
+    state_defaults || return 1
+  fi
+  state_migrate || return 1
+  return 0
+}
+
+state_set() {
+  state_init >/dev/null 2>&1 || return 1
+  state_write "$1" "$2"
+}

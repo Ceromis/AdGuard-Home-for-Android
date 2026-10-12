@@ -27,6 +27,10 @@ secrets.properties
 *.o
 *.so
 
+# Build-time generated credentials (never commit)
+app/app/src/main/java/com/adguardhome/android/BuildConstants.java
+app/app/src/main/java/com/adguardhome/android/BuildConstants.java.bak
+
 # Logs, diagnostics, and editor files
 *.log
 *.pid
@@ -36,3 +40,6 @@ secrets.properties
 Thumbs.db
 .vscode/
 
+# Native bridge build output and generated token header (never commit)
+module/system/bin/aghbridge
+native/_bridge_token.h

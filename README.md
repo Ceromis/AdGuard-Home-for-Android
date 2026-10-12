@@ -1,8 +1,5 @@
 # AdGuard Home for Android
 
-事先说明，该模块与https://github.com/liuzq2002/Adguard-Home-For-Magisk-Mod
-项目无关，拉取文件注意区分
-
 一个面向 `arm64-v8a` Android 设备的本地 DNS 过滤方案。项目将 AdGuard Home 作为 Magisk / KernelSU 模块中的常驻 DNS 服务运行，并提供原生 Android 管理器、受限特权控制桥、系统 DNS 接管、代理兼容、网络故障保护和完整恢复机制。
 
 ## 项目特点
@@ -17,7 +14,7 @@
 - **崩溃自愈**：服务监督器检测核心进程，先清理残留接管规则，再按退避策略重新启动。
 - **可审计恢复**：安装时保存 IFW、私有 DNS和出厂自定义规则；卸载时恢复 IFW 与系统网络状态。
 - **集中日志**：模块日志统一写入 `/data/adb/agh/logs`，管理器支持清理和打包导出。
-- **暂停倒计时**：有时限暂停期间持续显示剩余时间通知，到期后自动恢复过滤；不支持增强通知形态的设备继续使用普通通知。
+- **系统灵动岛**：Android 16 / ColorOS 16 / HyperOS 2.0 下用系统 Live Updates 胶囊显示过滤状态与暂停倒计时，支持始终显示、暂停时显示、仅状态栏信息三种模式；旧系统退回普通常驻通知。
 
 ## 总体架构
 
@@ -28,7 +25,7 @@ flowchart TB
         RESOLVER["Android DNSResolver / netd"]
         IPT["独立 iptables / ip6tables 链"]
         NET["Wi-Fi / 移动网络 / VPN"]
-        SYSTEMUI["SystemUI\n暂停倒计时通知"]
+        SYSTEMUI["SystemUI / 灵动岛\nLive Updates 胶囊"]
     end
 
     subgraph Module["Root 模块 /data/adb/modules/adguardhome"]
@@ -45,7 +42,7 @@ flowchart TB
         UI["Compose / Miuix / Material UI"]
         API["AdGuard Home API Client"]
         MCC["ModuleControlClient"]
-        TIMER["PauseCountdownService\n前台倒计时与自动恢复"]
+        TIMER["LiveIslandService\n系统胶囊与暂停倒计时"]
     end
 
     APP --> RESOLVER --> IPT --> AGH
@@ -53,8 +50,8 @@ flowchart TB
     UI --> API -->|"127.0.0.1:3000"| AGH
     UI --> MCC --> BRIDGE --> CTL
     UI -->|"开始或取消有时限暂停"| TIMER
-    TIMER -->|"持续更新剩余时间"| SYSTEMUI
-    SYSTEMUI -->|"点击通知"| UI
+    TIMER -->|"持续更新状态"| SYSTEMUI
+    SYSTEMUI -->|"点击胶囊/通知"| UI
     SYSTEMUI -->|"立即恢复"| TIMER
     TIMER -->|"到期恢复保护"| API
     SUP --> AGH
@@ -82,7 +79,7 @@ flowchart TB
 
 ## DNS 过滤链路
 
-运行时配置会将 AdGuard Home DNS 监听迁移到 `127.0.0.1:5353`，管理 API 监听 `127.0.0.1:3000`。Android DNSResolver 仍使用 `127.0.0.1:53`，再由模块规则重定向到实际监听端口。
+运行时配置会将 AdGuard Home DNS 监听迁移到 `127.0.0.1:5353`，管理 API 默认监听 `127.0.0.1:3000`（可在管理器设置中修改）。Android DNSResolver 仍使用 `127.0.0.1:53`，再由模块规则重定向到实际监听端口。
 
 ```mermaid
 sequenceDiagram
@@ -164,14 +161,14 @@ Android 代理应用通过真实 VPN `NetworkAgentInfo` 和 `OwnerUid` 判断是
 
 ### 适配内容
 
-`ProxyConfigEditor` 先解析 YAML 结构特征，再将受支持配置调整为 `redir-host`，并把下列 DNS 字段统一指向 `127.0.0.1:5353`：
+`ProxyConfigEditor` 先解析 YAML 结构特征，再将受支持配置调整为 `redir-host`。业务 DNS 字段指向 `127.0.0.1:5353`：
 
 - `nameserver`
 - `fallback`
-- `default-nameserver`
 - `direct-nameserver`
-- `proxy-server-nameserver`
 - `nameserver-policy`
+
+用于启动代理和解析节点域名的 `default-nameserver`、`proxy-server-nameserver` 使用独立 IP 引导 DNS，避免代理出站与 AdGuard Home 的加密上游互相依赖。
 
 用户保存的一个或多个 HTTP(S) 订阅地址会写入代理配置的 provider 结构。订阅备注仅保存在管理器本地，用于区分条目，不会写入代理 YAML。
 
@@ -200,13 +197,13 @@ stateDiagram-v2
 
 | 页面 | 功能 |
 | --- | --- |
-| 概览 | 每秒刷新运行状态；显示查询量、拦截量和拦截率；启动、停止、重启；开启/关闭过滤保护；预设或自定义时分秒暂停；暂停期间显示剩余时间通知 |
+| 概览 | 实时刷新运行状态；显示查询量、拦截量和拦截率；启动、停止、重启；开启/关闭过滤保护；预设或自定义时分秒暂停；暂停期间显示剩余时间通知 |
 | 查询 | 查看最近 DNS 查询、客户端、类型及拦截状态；清空查询日志；确认后为单个域名生成放行规则 |
 | 过滤 | 查看过滤订阅、规则数量及启用状态；新增订阅；更新全部过滤器 |
-| 设置 | 代理订阅兼容、主题、预测性返回手势、过滤器更新、缓存清理、系统 DNS、模块重启、紧急网络恢复、日志管理 |
+| 设置 | 代理订阅兼容、主题、预测性返回手势、管理端口修改、过滤器更新、缓存清理、系统 DNS、模块重启、紧急网络恢复、日志管理；危险操作均带二次确认 |
 | 自定义规则 | 页面进入时预载；批量新建；逐条编辑与删除；长按拖动排序；右侧快速跳转；恢复安装时保存的出厂规则 |
 | 代理订阅 | 多链接管理、可选备注、编辑与删除；展示等待代理/已生效/恢复状态；新增后给出即时反馈 |
-| 主题 | 默认、Miuix、Material 三种样式；暗色模式、Monet 动态色、自定义强调色、模糊效果 |
+| 主题 | Miuix（默认）、混合、Material 三种样式；暗色模式、Monet 动态色、自定义强调色、模糊效果 |
 | 关于 | 应用图标、版本、作者、QQ 交流群；清理日志；导出完整日志压缩包 |
 
 模块控制桥允许的动作在 `ModuleControlClient` 和 `aghbridge` 中双重白名单校验。管理 API 和控制桥都只绑定回环地址，不向局域网开放。
@@ -236,12 +233,12 @@ IFW 会影响本项目目标过滤策略，因此模块采用明确的备份、�
 
 | 路径 | 内容 |
 | --- | --- |
-| `/data/adb/agh/AdGuardHome.yaml` | 用户实际配置，模块升级时保留 |
+| `/data/adb/agh/AdGuardHome.yaml` | 运行配置；升级时端口、上游等设置保留，`user_rules` 随模块版本同步替换 |
 | `/data/adb/agh/work` | AdGuard Home 工作目录 |
 | `/data/adb/agh/logs` | 服务、控制、DNS、代理兼容、安装和故障现场日志 |
 | `/data/adb/agh/proxy-compat` | 代理路径、订阅、备份、文件状态和运行标记 |
 | `/data/adb/agh/ifw-backup` | 首次安装前的 IFW 快照 |
-| `/data/adb/agh/factory-user-rules.txt` | 安装时保存的出厂自定义规则 |
+| `/data/adb/agh/factory-user-rules.txt` | 随每个模块版本刷新的出厂自定义规则，供“恢复出厂规则”使用 |
 
 单个模块日志超过 512 KiB 后会保留末尾约 256 KiB，并在每日维护周期执行裁剪。管理器导出日志时会将当前日志打包为：
 
@@ -258,11 +255,11 @@ IFW 会影响本项目目标过滤策略，因此模块采用明确的备份、�
 │       ├── AndroidManifest.xml  管理器组件、权限与前台服务声明
 │       ├── java/com/adguardhome/android/
 │       │   ├── ManagerActivity.kt
-│       │   ├── PauseCountdownService.java
-│       │   └── ui/              Compose 页面、主题与交互组件
+│       │   ├── PortSync.kt       端口校准与控制桥 token 兼容
+│       │   ├── liveisland/       系统灵动岛（Live Updates）
+│       │   └── ui/               Compose 页面、主题与交互组件
 │       └── res/drawable/
-│           ├── ic_shield.xml
-│           └── ic_pause_timer.xml
+│           └── ic_shield.xml
 ├── module/                      Magisk / KernelSU 模块根目录
 │   ├── AdGuardHome.yaml         默认配置
 │   ├── customize.sh             安装、备份与 APK 安装
@@ -293,7 +290,7 @@ IFW 会影响本项目目标过滤策略，因此模块采用明确的备份、�
 ```powershell
 $env:ANDROID_HOME = '你的 Android SDK 路径'
 $env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
-Set-Location F:\kaiyuan
+Set-Location <项目目录>
 .\build.ps1
 ```
 
@@ -304,14 +301,17 @@ Set-Location F:\kaiyuan
 3. 将管理器 APK 放入模块，保留 Unix 可执行权限后生成刷入 ZIP；
 4. 输出到 `dist/`。
 
+`build.ps1` 会为每次构建生成随机的控制桥 token，并写入被 `.gitignore` 忽略的
+`BuildConstants.java`；该文件不要提交到仓库，克隆后直接运行 `build.ps1` 即可生成。
+
 ## 安装与使用
 
-1. 使用 Magisk、KernelSU 或兼容模块管理器刷入构建出的 ZIP。
+1. 使用 Magisk、KernelSU、SukiSU 或兼容模块管理器刷入构建出的 ZIP。
 2. 安装脚本会校验 `arm64-v8a`、保存系统状态并安装随包管理器 APK。
 3. 重启设备，服务会在 `sys.boot_completed=1` 后自动启动。
 4. 打开管理器查看概览和过滤状态。
 
-AdGuard Home 本地 Web/API 地址为 `http://127.0.0.1:3000`。默认账号和密码均为 `root`，接口只监听本机回环地址；仍建议首次使用后修改默认密码。
+AdGuard Home 本地 Web/API 地址默认为 `http://127.0.0.1:3000`，可在管理器“设置 → 修改端口”中调整；保存后模块会自动重启 AdGuard Home 使新端口生效。默认账号和密码均为 `root`，接口只监听本机回环地址；仍建议首次使用后修改默认密码。模块内置的规则集会在安装/升级时同步到运行配置和出厂规则备份。
 
 ## 兼容范围与限制
 
@@ -328,9 +328,10 @@ AdGuard Home 本地 Web/API 地址为 `http://127.0.0.1:3000`。默认账号和�
 
 项目包含 AdGuard Home `0.107.78` ARM64 二进制，其版权与许可证归上游项目所有；相关许可证和说明位于 `third_party/adguardhome/`。AndroidX、Jetpack Compose、Miuix、libsu 和 HiddenApiBypass 等依赖分别遵循各自的上游许可证。
 
-##项目创建原因
+## 作者
 
-因在团队中与liuzq2002起了一些用户使用体验性改进纠纷，故做的此项目
+- Ceromis：主导开发
+- Ling：共创
 
 ## 交流与反馈
 

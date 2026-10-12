@@ -19,9 +19,12 @@ import java.util.regex.Pattern;
 /** Minimal, formatting-preserving editor for the DNS block of Clash/Mihomo YAML files. */
 public final class ProxyConfigEditor {
     private static final Pattern KEY = Pattern.compile("^(\\s*)(['\\\"]?)([A-Za-z0-9_-]+)\\2\\s*:(.*)$");
-    private static final Set<String> DNS_SERVERS = new HashSet<>(Arrays.asList(
-            "nameserver", "fallback", "default-nameserver", "direct-nameserver",
-            "proxy-server-nameserver"));
+    private static final Set<String> FILTERED_DNS_SERVERS = new HashSet<>(Arrays.asList(
+            "nameserver", "fallback", "direct-nameserver"));
+    private static final Set<String> BOOTSTRAP_DNS_SERVERS = new HashSet<>(Arrays.asList(
+            "default-nameserver", "proxy-server-nameserver"));
+    private static final List<String> PROXY_BOOTSTRAP_DNS = Arrays.asList(
+            "223.5.5.5", "119.29.29.29");
 
     private ProxyConfigEditor() {
     }
@@ -149,6 +152,12 @@ public final class ProxyConfigEditor {
 
         boolean enhancedFound = false;
         boolean nameserverFound = false;
+        boolean defaultNameserverFound = false;
+        boolean proxyServerNameserverFound = false;
+        // 修复 bug:Clash.Meta 的 tun 模式与 enhanced-mode=fake-ip 配套才能正确解析,
+        // 原版 Clash 用 redir-host。强制写 redir-host 会让 tun 用户 DNS 解析失败。
+        boolean tunMode = findTopLevelKey(source, "tun") >= 0;
+        String enhancedModeValue = tunMode ? "fake-ip" : "redir-host";
         for (int i = dnsStart + 1; i < dnsEnd; i++) {
             Matcher matcher = KEY.matcher(result.get(i));
             if (!matcher.matches() || matcher.group(1).length() != childIndent) continue;
@@ -156,10 +165,14 @@ public final class ProxyConfigEditor {
             if ("enable".equals(key)) {
                 result.set(i, spaces(childIndent) + "enable: true");
             } else if ("enhanced-mode".equals(key)) {
-                result.set(i, spaces(childIndent) + "enhanced-mode: redir-host");
+                result.set(i, spaces(childIndent) + "enhanced-mode: " + enhancedModeValue);
                 enhancedFound = true;
             } else if ("nameserver".equals(key)) {
                 nameserverFound = true;
+            } else if ("default-nameserver".equals(key)) {
+                defaultNameserverFound = true;
+            } else if ("proxy-server-nameserver".equals(key)) {
+                proxyServerNameserverFound = true;
             }
         }
 
@@ -171,6 +184,23 @@ public final class ProxyConfigEditor {
         if (!nameserverFound) {
             result.add(insertion, spaces(childIndent) + "nameserver:");
             result.add(insertion + 1, spaces(childIndent + 2) + "- " + localDns);
+            insertion += 2;
+        }
+        if (!defaultNameserverFound) {
+            result.add(insertion++, spaces(childIndent) + "default-nameserver:");
+            for (String server : PROXY_BOOTSTRAP_DNS) {
+                result.add(insertion++, spaces(childIndent + 2) + "- " + server);
+            }
+        }
+        // 修复 bug:`proxy-server-nameserver` 是 Mihomo / Clash Meta 专属字段,
+        // 原版 Clash 没有这个 key。原代码无差别追加,对原版 Clash 来说是无效字段,
+        // 多数情况会被忽略,但部分 Clash 校验严格的内核会拒绝加载,造成兼容问题。
+        // 仅在判定为 Mihomo 时才注入。
+        if (!proxyServerNameserverFound && looksLikeMihomo(source)) {
+            result.add(insertion++, spaces(childIndent) + "proxy-server-nameserver:");
+            for (String server : PROXY_BOOTSTRAP_DNS) {
+                result.add(insertion++, spaces(childIndent + 2) + "- " + server);
+            }
         }
         return result;
     }
@@ -180,10 +210,13 @@ public final class ProxyConfigEditor {
         for (int i = end - 1; i > start; i--) {
             Matcher matcher = KEY.matcher(lines.get(i));
             if (!matcher.matches() || matcher.group(1).length() != childIndent
-                    || !DNS_SERVERS.contains(matcher.group(3))) continue;
+                    || (!FILTERED_DNS_SERVERS.contains(matcher.group(3))
+                    && !BOOTSTRAP_DNS_SERVERS.contains(matcher.group(3)))) continue;
             int sectionEnd = blockEnd(lines, i, childIndent);
-            replaceValue(lines, i, sectionEnd, childIndent, matcher.group(2), matcher.group(3), localDns);
-            end += 2 - (sectionEnd - i);
+            List<String> servers = BOOTSTRAP_DNS_SERVERS.contains(matcher.group(3))
+                    ? PROXY_BOOTSTRAP_DNS : Arrays.asList(localDns);
+            replaceValue(lines, i, sectionEnd, childIndent, matcher.group(2), matcher.group(3), servers);
+            end += servers.size() + 1 - (sectionEnd - i);
         }
         return end;
     }
@@ -221,15 +254,26 @@ public final class ProxyConfigEditor {
     }
 
     private static void replaceValue(List<String> lines, int start, int end, int indent,
-                                     String quote, String key, String localDns) {
+                                     String quote, String key, List<String> servers) {
         for (int i = end - 1; i >= start; i--) lines.remove(i);
         lines.add(start, spaces(indent) + quote + key + quote + ":");
-        lines.add(start + 1, spaces(indent + 2) + "- " + localDns);
+        for (int i = 0; i < servers.size(); i++) {
+            lines.add(start + 1 + i, spaces(indent + 2) + "- " + servers.get(i));
+        }
     }
 
     private static boolean looksLikeClash(List<String> lines) {
         return findTopLevelKey(lines, "proxies") >= 0 || findTopLevelKey(lines, "proxy-providers") >= 0
                 || findTopLevelKey(lines, "rules") >= 0 || findTopLevelKey(lines, "tun") >= 0;
+    }
+
+    /**
+     * Mihomo / Clash.Meta 专属识别:仅当配置里出现 Mihomo 才有的 {@code proxy-providers}
+     * 时才算 Mihomo。Clash Meta for Android 与 Mihomo 一致;原版 Clash 没有
+     * proxy-providers 字段,会落到 false。
+     */
+    private static boolean looksLikeMihomo(List<String> lines) {
+        return findTopLevelKey(lines, "proxy-providers") >= 0;
     }
 
     private static int findTopLevelKey(List<String> lines, String wanted) {

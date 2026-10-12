@@ -1,8 +1,11 @@
 package com.adguardhome.android.ui
 
 import android.app.Activity
+import android.content.Context
+import android.content.res.Configuration
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
@@ -23,15 +26,14 @@ import top.yukonga.miuix.kmp.theme.ColorSchemeMode
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.ThemeController
 
-enum class UiStyle { DEFAULT, MIUIX, MATERIAL }
+enum class UiStyle { MIUIX, DEFAULT, MATERIAL }
 
 data class ThemeSettings(
-    val style: UiStyle = UiStyle.DEFAULT,
+    val style: UiStyle = UiStyle.MIUIX,
     val dark: Boolean = false,
     val monet: Boolean = false,
     val floatingBar: Boolean = false,
     val blurBars: Boolean = false,
-    val liquidGlass: Boolean = false,
     val predictiveBack: Boolean = false,
     val accent: Int = 0xFF0067C0.toInt(),
 )
@@ -41,30 +43,67 @@ val LocalThemeSettings = compositionLocalOf { mutableStateOf(ThemeSettings()) }
 @Composable
 fun ManagerTheme(content: @Composable () -> Unit) {
     val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences("theme_config", 0) }
     val systemDark = isSystemInDarkTheme()
-    val settings = remember {
-        mutableStateOf(
-            ThemeSettings(
-                style = when (prefs.getString("mode", "default")) {
-                    "miuix" -> UiStyle.MIUIX
-                    "material" -> UiStyle.MATERIAL
-                    else -> UiStyle.DEFAULT
-                },
-                dark = prefs.getBoolean("dark", systemDark),
-                monet = prefs.getBoolean("monet", false),
-                floatingBar = prefs.getBoolean("floating", false),
-                blurBars = prefs.getBoolean("blur", false),
-                liquidGlass = prefs.getBoolean("liquid", false),
-                predictiveBack = prefs.getBoolean("gesture", false),
-                accent = prefs.getInt("accent", 0xFF0067C0.toInt()),
-            )
-        )
-    }
+    val settings = remember { mutableStateOf(readThemeSettings(context, systemDark)) }
     val value = settings.value
-    val accent = Color(value.accent)
+    val colors = managerColorScheme(value, value.dark)
+
+
+    LaunchedEffect(value.dark) {
+        val window = (context as? Activity)?.window ?: return@LaunchedEffect
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            isAppearanceLightStatusBars = !value.dark
+            isAppearanceLightNavigationBars = !value.dark
+        }
+    }
+
+    val themedContent: @Composable () -> Unit = {
+        MaterialTheme(colorScheme = colors) {
+            // Miuix 容器只提供它自己的 LocalContentColor,Material 文本拿不到,
+            // 会退回默认黑色;这里在根节点补上跟随主题的内容色。
+            CompositionLocalProvider(
+                LocalContentColor provides colors.onBackground,
+                LocalThemeSettings provides settings,
+                content = content,
+            )
+        }
+    }
+    // Keep one stable theme node around the app. Replacing the root wrapper when
+    // switching style disposes the pager and makes the manager appear to restart.
+    MiuixTheme(
+        controller = ThemeController(
+            colorSchemeMode = if (value.dark) ColorSchemeMode.Dark else ColorSchemeMode.Light,
+            keyColor = colors.primary,
+            isDark = value.dark,
+        ),
+        content = themedContent,
+    )
+}
+
+
+fun readThemeSettings(context: Context, systemDark: Boolean = isNightMode(context)): ThemeSettings {
+    val prefs = context.getSharedPreferences("theme_config", 0)
+    return ThemeSettings(
+        style = when (prefs.getString("mode", "miuix")) {
+            "default" -> UiStyle.DEFAULT
+            "material" -> UiStyle.MATERIAL
+            else -> UiStyle.MIUIX
+        },
+        dark = prefs.getBoolean("dark", systemDark),
+        monet = prefs.getBoolean("monet", false),
+        floatingBar = prefs.getBoolean("floating", false),
+        blurBars = prefs.getBoolean("blur", false),
+        predictiveBack = prefs.getBoolean("gesture", false),
+        accent = prefs.getInt("accent", 0xFF0067C0.toInt()),
+    )
+}
+
+@Composable
+fun managerColorScheme(settings: ThemeSettings, dark: Boolean): androidx.compose.material3.ColorScheme {
+    val context = LocalContext.current
+    val accent = Color(settings.accent)
     val accentOn = if (accent.luminance() > 0.48f) Color(0xFF111111) else Color.White
-    val accentContainer = if (value.dark) {
+    val accentContainer = if (dark) {
         Color(
             red = accent.red * 0.38f + 0.08f,
             green = accent.green * 0.38f + 0.08f,
@@ -119,34 +158,14 @@ fun ManagerTheme(content: @Composable () -> Unit) {
         surfaceContainerHigh = Color(0xFF292D34),
         surfaceContainerHighest = Color(0xFF33373E),
     )
-    val colors = if (value.monet && Build.VERSION.SDK_INT >= 31) {
-        if (value.dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-    } else if (value.dark) fixedDark else fixedLight
-
-    LaunchedEffect(value.dark) {
-        val window = (context as? Activity)?.window ?: return@LaunchedEffect
-        WindowInsetsControllerCompat(window, window.decorView).apply {
-            isAppearanceLightStatusBars = !value.dark
-            isAppearanceLightNavigationBars = !value.dark
-        }
-    }
-
-    val themedContent: @Composable () -> Unit = {
-        MaterialTheme(colorScheme = colors) {
-            CompositionLocalProvider(LocalThemeSettings provides settings, content = content)
-        }
-    }
-    // Keep one stable theme node around the app. Replacing the root wrapper when
-    // switching style disposes the pager and makes the manager appear to restart.
-    MiuixTheme(
-        controller = ThemeController(
-            colorSchemeMode = if (value.dark) ColorSchemeMode.Dark else ColorSchemeMode.Light,
-            keyColor = colors.primary,
-            isDark = value.dark,
-        ),
-        content = themedContent,
-    )
+    return if (settings.monet && Build.VERSION.SDK_INT >= 31) {
+        if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+    } else if (dark) fixedDark else fixedLight
 }
+
+private fun isNightMode(context: Context): Boolean =
+    (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+        Configuration.UI_MODE_NIGHT_YES
 
 fun saveTheme(context: android.content.Context, value: ThemeSettings) {
     context.getSharedPreferences("theme_config", 0).edit()
@@ -155,7 +174,6 @@ fun saveTheme(context: android.content.Context, value: ThemeSettings) {
         .putBoolean("monet", value.monet)
         .putBoolean("floating", value.floatingBar)
         .putBoolean("blur", value.blurBars)
-        .putBoolean("liquid", value.liquidGlass)
         .putBoolean("gesture", value.predictiveBack)
         .putInt("accent", value.accent)
         .apply()

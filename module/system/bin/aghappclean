@@ -3,58 +3,61 @@
 # Aggressive mode: remove complete application cache directories plus known
 # advertising resources while the module is active.  File locks are excluded.
 DATA_DIR=${AGH_DATA_DIR:-/data/adb/agh}
-PID_FILE=$DATA_DIR/appclean.pid
-PRIVATE_DNS_STATE=$DATA_DIR/private-dns.state
+STATE_FILE=$DATA_DIR/adgyaml
+AGH_STATE_LIB=${AGH_STATE_LIB:-/data/adb/modules/adguardhome/system/bin/aghstate}
+[ -r "$AGH_STATE_LIB" ] || AGH_STATE_LIB=${0%/*}/aghstate
+AGH_STATE_LIB_ALT=${0%/*}/../system/bin/aghstate
+[ -r "$AGH_STATE_LIB" ] || AGH_STATE_LIB=$AGH_STATE_LIB_ALT
 IFW_DIR=/data/system/ifw
+
+. "$AGH_STATE_LIB" 2>/dev/null || :
 
 log() {
   mkdir -p "$DATA_DIR/logs" 2>/dev/null
   echo "$(date '+%Y-%m-%d %H:%M:%S') appclean: $*" >> "$DATA_DIR/logs/appclean.log"
 }
 
+
+
 save_private_dns_state() {
-  [ -s "$PRIVATE_DNS_STATE" ] && return 0
-  mkdir -p "$DATA_DIR" || return 1
-  {
-    echo "mode=$(settings get global private_dns_mode 2>/dev/null)"
-    echo "specifier=$(settings get global private_dns_specifier 2>/dev/null)"
-  } > "$PRIVATE_DNS_STATE.tmp.$$" || return 1
-  chmod 600 "$PRIVATE_DNS_STATE.tmp.$$"
-  mv "$PRIVATE_DNS_STATE.tmp.$$" "$PRIVATE_DNS_STATE"
+  [ "$(state_get private_dns_saved)" = "1" ] && return 0
+  state_set private_dns_mode "$(settings get global private_dns_mode 2>/dev/null)" || return 1
+  state_set private_dns_specifier "$(settings get global private_dns_specifier 2>/dev/null)" || return 1
+  state_set private_dns_saved 1
   log "saved private DNS state"
 }
 
 restore_private_dns_state() {
   local mode specifier
-  [ -s "$PRIVATE_DNS_STATE" ] || return 0
-  mode=$(sed -n 's/^mode=//p' "$PRIVATE_DNS_STATE" | head -n 1)
-  specifier=$(sed -n 's/^specifier=//p' "$PRIVATE_DNS_STATE" | head -n 1)
+  [ "$(state_get private_dns_saved)" = "1" ] || return 0
+  mode=$(state_get private_dns_mode)
+  specifier=$(state_get private_dns_specifier)
   case "$mode" in ''|null) settings delete global private_dns_mode >/dev/null 2>&1 ;; *) settings put global private_dns_mode "$mode" >/dev/null 2>&1 || return 1 ;; esac
   case "$specifier" in ''|null) settings delete global private_dns_specifier >/dev/null 2>&1 ;; *) settings put global private_dns_specifier "$specifier" >/dev/null 2>&1 || return 1 ;; esac
-  rm -f "$PRIVATE_DNS_STATE"
+  state_set private_dns_saved 0
+  state_set private_dns_mode ''
+  state_set private_dns_specifier ''
   log "restored private DNS state"
 }
 
 stop_cleaner() {
-  if [ -s "$PID_FILE" ]; then
-    pid=$(cat "$PID_FILE" 2>/dev/null)
-    case "$pid" in
-      ''|*[!0-9]*) ;;
-      *) kill "$pid" 2>/dev/null ;;
-    esac
-  fi
-  rm -f "$PID_FILE"
+  local pid
+  pid=$(state_get appclean_pid 2>/dev/null)
+  case "$pid" in
+    ''|*[!0-9]*|0) ;;
+    *) kill "$pid" 2>/dev/null ;;
+  esac
+  state_set appclean_pid 0
   restore_private_dns_state
 }
 
 request_refresh() {
-  if [ -s "$PID_FILE" ]; then
-    pid=$(cat "$PID_FILE" 2>/dev/null)
-    case "$pid" in
-      ''|*[!0-9]*) ;;
-      *) kill -USR1 "$pid" 2>/dev/null ;;
-    esac
-  fi
+  local pid
+  pid=$(state_get appclean_pid 2>/dev/null)
+  case "$pid" in
+    ''|*[!0-9]*|0) ;;
+    *) kill -USR1 "$pid" 2>/dev/null ;;
+  esac
 }
 
 case "$1" in
@@ -62,17 +65,15 @@ case "$1" in
   --refresh) request_refresh; exit 0 ;;
 esac
 
-if [ -s "$PID_FILE" ]; then
-  previous=$(cat "$PID_FILE" 2>/dev/null)
-  case "$previous" in
-    *[!0-9]*|'') ;;
-    *) kill -0 "$previous" 2>/dev/null && exit 0 ;;
-  esac
-fi
+state_init || exit 1
+previous=$(state_get appclean_pid 2>/dev/null)
+case "$previous" in
+  *[!0-9]*|''|0) ;;
+  *) kill -0 "$previous" 2>/dev/null && exit 0 ;;
+esac
 
-mkdir -p "$DATA_DIR"
-echo $$ > "$PID_FILE"
-trap 'rm -f "$PID_FILE"; exit 0' HUP INT TERM EXIT
+state_set appclean_pid "$$"
+trap 'state_set appclean_pid 0; exit 0' HUP INT TERM EXIT
 
 targets() {
   cat <<'EOF'

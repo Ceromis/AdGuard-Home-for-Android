@@ -12,14 +12,20 @@ android {
     }
 
     defaultConfig {
-        applicationId 'com.adguardhome.android'
+        // 主版本唯一变体。移除 lite 后直接用 standard 包名,保留旧升级路径。
+        applicationId 'com.adguardhome.android.standard'
+        // Miuix 0.9.3 依赖最低 Android 13,因此 minSdk 保留 33。
         minSdk 33
         targetSdk 35
-    versionCode 39
-    versionName '1.2.4(0.107.78)'
+        versionCode 45
+        versionName '1.2.7'
+        resValue 'string', 'app_name', 'AdGuard Home'
     }
+
     buildFeatures {
         compose true
+        buildConfig true
+        resValues true
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17

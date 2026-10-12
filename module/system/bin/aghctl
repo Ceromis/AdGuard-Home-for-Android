@@ -1,53 +1,274 @@
 #!/system/bin/sh
+# ==============================================================================
+# AdGuard Home for Android - 核心控制脚本 (aghctl)
+# ==============================================================================
+# 功能：管理 AdGuard Home 服务的完整生命周期，包括：
+#   - 服务启动/停止/重启
+#   - DNS 接管（通过 Android DNSResolver）
+#   - iptables 规则管理（DNS 流量重定向）
+#   - IPv6 DNS 回退处理
+#   - 加密 DNS 防护（DoT/DoQ 拦截）
+#   - 网络故障保护
+#   - 代理兼容性管理
+#   - 日志导出和清理
+#   - 配置迁移和修复
+#
+# 使用方式：aghctl <command> [argument]
+# 支持的命令：start, stop, restart, status, rules, cleanup, sync, ...
+# ==============================================================================
 
-MODDIR=${AGH_MODDIR:-${0%/*}/../..}
-DATA_DIR=${AGH_DATA_DIR:-/data/adb/agh}
-CONFIG=$DATA_DIR/AdGuardHome.yaml
-AGH_BIN=$MODDIR/system/bin/AdGuardHome
-PID_FILE=$DATA_DIR/agh.pid
-LAUNCH_FILE=$DATA_DIR/agh.launch
-DISABLED_FILE=$DATA_DIR/disabled
-RESOLVER_STATE=$DATA_DIR/resolver.state
-RESOLVER_BLOCKED=$DATA_DIR/resolver.blocked
-RESOLVER_HEALTH=$DATA_DIR/resolver.health
-RESOLVER_LOG=$DATA_DIR/logs/resolver.log
-DNS_HELPER_APK=
-APP_PROCESS=
-LOG_FILE=$DATA_DIR/logs/AdGuardHome.log
-CONTROL_LOCK=$DATA_DIR/control.lock
-CA_BUNDLE=$DATA_DIR/cacerts.pem
-IPTABLES=$(command -v iptables)
-IP6TABLES=$(command -v ip6tables)
-PROXY_CTL=$MODDIR/system/bin/aghproxy
-APP_CLEANER=$MODDIR/system/bin/aghappclean
-SEED_FILTER_DIR=$MODDIR/seed/filters
-FILTER_CACHE_DIR=$DATA_DIR/work/data/filters
-BROWSER_RESET_STATE=$DATA_DIR/browser-reset.boot
-NETWORK_ALERT=$DATA_DIR/network-alert
+# ==============================================================================
+# 路径和文件配置
+# ==============================================================================
 
-log() {
-  mkdir -p "${LOG_FILE%/*}" 2>/dev/null
-  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
+# --- 基础路径 ---
+MODDIR=${AGH_MODDIR:-${0%/*}/../..}                          # 模块根目录
+DATA_DIR=${AGH_DATA_DIR:-/data/adb/agh}                       # 数据持久化目录
+CONFIG=$DATA_DIR/AdGuardHome.yaml                              # AdGuard Home 配置文件
+TEMPLATE_CONFIG=$MODDIR/AdGuardHome.yaml                       # 模块内置模板配置(规则来源)
+FACTORY_RULES_BACKUP=$DATA_DIR/factory-user-rules.txt          # 出厂用户规则备份(恢复出厂用)
+AGH_BIN=$MODDIR/system/bin/AdGuardHome                        # AdGuard Home 二进制
+
+# --- 统一运行时状态 ---
+STATE_FILE=$DATA_DIR/adgyaml                                   # 唯一运行时状态文件（pid/端口/接管/告警）
+AGH_STATE_LIB=$MODDIR/system/bin/aghstate                      # 共享状态读写实现（state_get/state_set）
+
+# --- 日志文件 ---
+RESOLVER_LOG=$DATA_DIR/logs/resolver.log                       # DNS 设置器日志
+LOG_FILE=$DATA_DIR/logs/AdGuardHome.log                        # 主控制日志
+
+# --- 并发控制 ---
+CONTROL_LOCK=$DATA_DIR/control.lock                            # 控制锁目录（防止并发操作）
+
+# --- CA 证书 ---
+CA_BUNDLE=$DATA_DIR/work/cacerts.pem                           # Android 系统 CA 合并包（放进 work 运行时目录）
+
+# --- iptables 工具路径 ---
+IPTABLES=$(command -v iptables)                                # iptables 可执行文件
+IP6TABLES=$(command -v ip6tables)                              # ip6tables 可执行文件
+
+# --- 辅助工具 ---
+PROXY_CTL=$MODDIR/system/bin/aghproxy                          # 代理兼容控制脚本
+APP_CLEANER=$MODDIR/system/bin/aghappclean                     # 系统策略清理器
+
+# --- 过滤器缓存 ---
+SEED_FILTER_DIR=$MODDIR/seed/filters                           # 离线种子规则目录
+FILTER_CACHE_DIR=$DATA_DIR/work/data/filters                   # 过滤器缓存目录
+
+
+# --- DNS 辅助器（用于 IPv6 DNSResolver 操作）---
+DNS_HELPER_APK=                                                # DNS 辅助器 APK 路径（运行时填充）
+APP_PROCESS=                                                   # app_process 路径（运行时填充）
+
+# ==============================================================================
+# 跨平台兼容函数
+# Android 系统可能使用 toybox 或 busybox 提供基础命令
+# ==============================================================================
+
+portable_date() {
+  if [ -x /system/bin/toybox ]; then
+    /system/bin/toybox date "$@"
+  else
+    date "$@"
+  fi
 }
 
-acquire_control_lock() {
-  local waited=0 owner
-  mkdir -p "$DATA_DIR" 2>/dev/null || return 1
-  while ! mkdir "$CONTROL_LOCK" 2>/dev/null; do
-    owner=$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$CONTROL_LOCK/owner" 2>/dev/null | head -n 1)
-    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-      rm -rf "$CONTROL_LOCK" 2>/dev/null
-      continue
+portable_sleep() {
+  if [ -x /system/bin/toybox ]; then
+    /system/bin/toybox sleep "$@"
+  else
+    sleep "$@"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# 统一运行时状态 (adgyaml)
+# 读写实现集中在 system/bin/aghstate,所有标记共用一个文件。
+# ------------------------------------------------------------------------------
+. "$AGH_STATE_LIB" 2>/dev/null || :
+state_init >/dev/null 2>&1 || :
+
+# ------------------------------------------------------------------------------
+# log - 记录日志到控制日志文件
+# 参数：$* = 日志内容
+# 格式：YYYY-MM-DD HH:MM:SS <message>
+# ------------------------------------------------------------------------------
+log() {
+  mkdir -p "${LOG_FILE%/*}" 2>/dev/null
+  echo "$(portable_date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
+}
+
+# ==============================================================================
+# 控制锁管理
+# ==============================================================================
+# 使用目录作为原子锁（mkdir 是原子操作）
+# 锁文件结构：$CONTROL_LOCK/owner 包含 "pid=<PID> action=<action>"
+#
+# 设计要点：
+#   1. 使用 mkdir 实现原子锁获取
+#   2. 通过 PID 和进程名验证锁持有者是否存活
+#   3. 检测僵尸进程和超时进程
+#   4. 自动清理过期锁（60 秒超时）
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# cleanup_stale_lock - 清理残留的控制锁
+# 功能：在脚本启动时自动清理可能残留的锁目录
+#       解决进程被 SIGKILL 后 trap 无法执行导致的锁残留问题
+# ------------------------------------------------------------------------------
+cleanup_stale_lock() {
+  local lock_pid lock_action lock_age now
+  [ -d "$CONTROL_LOCK" ] || return 0                           # 锁目录不存在则跳过
+
+  # 没有 owner 文件的孤立锁目录
+  if [ ! -f "$CONTROL_LOCK/owner" ]; then
+    rm -rf "$CONTROL_LOCK" 2>/dev/null
+    log "removed orphan control lock directory"
+    return 0
+  fi
+
+  # 读取锁的持有者信息
+  lock_pid=$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$CONTROL_LOCK/owner" 2>/dev/null | sed -n '1p')
+  lock_action=$(sed -n 's/^action=//p' "$CONTROL_LOCK/owner" 2>/dev/null | sed -n '1p')
+
+  # 检查持有锁的进程是否已死亡
+  if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+    rm -rf "$CONTROL_LOCK" 2>/dev/null
+    log "cleaned stale control lock (dead pid=$lock_pid, action=$lock_action)"
+    return 0
+  fi
+
+  # 检查锁文件年龄，超过 60 秒视为过期
+  now=$(portable_date +%s 2>/dev/null)
+  if [ -n "$now" ] && [ -f "$CONTROL_LOCK/owner" ]; then
+    if command -v stat >/dev/null 2>&1; then
+      lock_age=$(stat -c %Y "$CONTROL_LOCK/owner" 2>/dev/null)
+    else
+      lock_age=$(ls -l --time=ctime "$CONTROL_LOCK/owner" 2>/dev/null | awk '{print $6}')
     fi
+    if [ -n "$lock_age" ] && [ -n "$now" ]; then
+      lock_age=$((now - lock_age))
+      if [ "$lock_age" -ge 60 ]; then
+        rm -rf "$CONTROL_LOCK" 2>/dev/null
+        log "cleaned stale control lock (age=${lock_age}s, pid=$lock_pid, action=$lock_action)"
+        return 0
+      fi
+    fi
+  fi
+
+  return 0
+}
+
+# 启动时清理残留的控制锁(函数必须先定义再调用,否则 stderr 会污染控制桥输出)
+cleanup_stale_lock
+
+# ------------------------------------------------------------------------------
+# acquire_control_lock - 获取控制锁
+# 参数：$1 = 当前执行的操作名称
+# 返回：0 = 成功获取锁，1 = 无法创建数据目录，75 = 锁被占用（busy）
+#
+# 锁机制说明：
+#   - 使用 mkdir 作为原子操作（在文件系统级别是原子的）
+#   - 锁目录：$CONTROL_LOCK/
+#   - 锁文件：$CONTROL_LOCK/owner（记录 PID 和操作名称）
+#   - 等待超时：15 秒
+#
+# 锁清理策略：
+#   1. 锁文件超过 30 秒 → 强制释放
+#   2. 持有锁的进程已死亡 → 释放锁
+#   3. 持有锁的进程是僵尸进程 → 释放锁
+#   4. 持有锁的 shell 进程运行超过 120 秒 → 强制终止并释放锁
+#   5. 正常退出时通过 trap 自动释放锁
+# ------------------------------------------------------------------------------
+acquire_control_lock() {
+  local waited=0 owner lock_pid lock_action lock_age now
+  mkdir -p "$DATA_DIR" 2>/dev/null || return 1
+
+  # 循环尝试获取锁
+  while ! mkdir "$CONTROL_LOCK" 2>/dev/null; do
+    # 锁已存在，检查锁的持有者
+    if [ -f "$CONTROL_LOCK/owner" ]; then
+      lock_pid=$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$CONTROL_LOCK/owner" 2>/dev/null | sed -n '1p')
+      lock_action=$(sed -n 's/^action=//p' "$CONTROL_LOCK/owner" 2>/dev/null | sed -n '1p')
+
+      # 检查锁文件年龄，超过 30 秒视为过期
+      if [ -f "$CONTROL_LOCK/owner" ]; then
+        now=$(portable_date +%s 2>/dev/null)
+        if [ -n "$now" ]; then
+          if command -v stat >/dev/null 2>&1; then
+            lock_age=$(stat -c %Y "$CONTROL_LOCK/owner" 2>/dev/null)
+          else
+            lock_age=$(ls -l --time=ctime "$CONTROL_LOCK/owner" 2>/dev/null | awk '{print $6}')
+          fi
+          if [ -n "$lock_age" ] && [ -n "$now" ]; then
+            lock_age=$((now - lock_age))
+            if [ "$lock_age" -ge 30 ]; then
+              log "stale control lock detected (age=${lock_age}s, pid=$lock_pid, action=$lock_action); forcibly releasing"
+              rm -rf "$CONTROL_LOCK" 2>/dev/null
+              continue
+            fi
+          fi
+        fi
+      fi
+
+      # 检查持有锁的进程是否存活
+      if [ -n "$lock_pid" ]; then
+        if ! kill -0 "$lock_pid" 2>/dev/null; then
+          # 进程不存在，检查是否是僵尸进程
+          if [ -f "/proc/$lock_pid/status" ]; then
+            local state=$(grep '^State:' "/proc/$lock_pid/status" 2>/dev/null | awk '{print $2}')
+            if [ "$state" = "Z" ]; then
+              log "zombie process detected as lock owner (pid=$lock_pid); releasing lock"
+              rm -rf "$CONTROL_LOCK" 2>/dev/null
+              continue
+            fi
+          fi
+          # 进程已完全退出，释放锁
+          rm -rf "$CONTROL_LOCK" 2>/dev/null
+          continue
+        fi
+
+        # 进程存活，检查是否是卡死的 shell 进程
+        if [ -f "/proc/$lock_pid/comm" ]; then
+          local proc_name=$(cat "/proc/$lock_pid/comm" 2>/dev/null)
+          if [ "$proc_name" = "sh" ] || [ "$proc_name" = "busybox" ]; then
+            local proc_start=$(stat -c %Y "/proc/$lock_pid" 2>/dev/null)
+            if [ -n "$proc_start" ] && [ -n "$now" ]; then
+              local proc_age=$((now - proc_start))
+              if [ "$proc_age" -ge 120 ]; then
+                log "hung shell process detected (pid=$lock_pid, age=${proc_age}s, action=$lock_action); killing and releasing lock"
+                kill -9 "$lock_pid" 2>/dev/null
+                rm -rf "$CONTROL_LOCK" 2>/dev/null
+                continue
+              fi
+            fi
+          fi
+        fi
+      fi
+    fi
+
+    # 等待锁释放，最多等待 15 秒
     [ "$waited" -ge 15 ] && { log "control action busy; refusing overlapping operation: $1"; return 75; }
-    sleep 1
+    portable_sleep 1
     waited=$((waited + 1))
   done
+
+  # 成功获取锁，记录持有者信息
   echo "pid=$$ action=$1" > "$CONTROL_LOCK/owner"
+  # 注册退出时自动释放锁的 trap
   trap 'rm -rf "$CONTROL_LOCK" 2>/dev/null' EXIT HUP INT TERM
   return 0
 }
 
+# ------------------------------------------------------------------------------
+# seed_filter_cache - 初始化离线过滤器缓存
+# 功能：将模块中预置的种子规则复制到工作目录
+#       这些是离线规则，在首次启动或远程更新失败时使用
+# 返回：0 = 复制了新规则，1 = 没有种子目录，1 = 缓存已存在
+# 过滤器 ID：
+#   - 1721861844, 1721861846: 预置过滤器
+#   - 1735560833, 1735560834: AdGuard DNS Filter 等
+# ------------------------------------------------------------------------------
 seed_filter_cache() {
   local filter_id source target copied=1
   [ -d "$SEED_FILTER_DIR" ] || return 1
@@ -55,8 +276,8 @@ seed_filter_cache() {
   for filter_id in 1721861844 1721861846 1735560833 1735560834; do
     source=$SEED_FILTER_DIR/$filter_id.txt
     target=$FILTER_CACHE_DIR/$filter_id.txt
-    [ -s "$source" ] || continue
-    if [ ! -s "$target" ]; then
+    [ -s "$source" ] || continue                                    # 种子文件不存在或为空则跳过
+    if [ ! -s "$target" ]; then                                     # 缓存文件不存在才复制
       cp "$source" "$target" || continue
       chmod 600 "$target"
       copied=0
@@ -66,19 +287,116 @@ seed_filter_cache() {
   return "$copied"
 }
 
+# ------------------------------------------------------------------------------
+# factory_rules - 获取出厂时保存的用户规则
+# 功能：返回安装时保存的用户自定义规则
+#       用于"恢复出厂规则"功能
+# ------------------------------------------------------------------------------
 factory_rules() {
   local backup=$DATA_DIR/factory-user-rules.txt
   [ -s "$backup" ] || { echo factory-rules-backup-missing; return 1; }
   cat "$backup"
 }
 
+# ------------------------------------------------------------------------------
+# 模板规则同步(直接复制替换)
+# 模块升级/版本变化时:用模板 user_rules 覆盖运行配置的同名段,
+# 并按模板重写 factory-user-rules.txt,保证"恢复出厂规则"拿到最新规则。
+# ------------------------------------------------------------------------------
+copy_template_rules() {
+  local template=$TEMPLATE_CONFIG
+  [ -s "$template" ] || return 0
+  mkdir -p "$DATA_DIR/work" 2>/dev/null
+
+  # 1) 出厂规则备份:纯规则文本(去掉 YAML 引号)
+  awk '
+    /^user_rules:/ { found = 1; next }
+    found && /^[a-zA-Z_]+:/ { exit }
+    found { print }
+  ' "$template" | sed "s/^  - //; s/^'//; s/'$//" > "$FACTORY_RULES_BACKUP.tmp.$$" 2>/dev/null || return 1
+  [ -s "$FACTORY_RULES_BACKUP.tmp.$$" ] || { rm -f "$FACTORY_RULES_BACKUP.tmp.$$"; return 1; }
+  chmod 600 "$FACTORY_RULES_BACKUP.tmp.$$" 2>/dev/null || :
+  mv "$FACTORY_RULES_BACKUP.tmp.$$" "$FACTORY_RULES_BACKUP" || { rm -f "$FACTORY_RULES_BACKUP.tmp.$$"; return 1; }
+
+  # 2) 运行配置:直接用模板的 user_rules 段整体替换
+  if [ -s "$CONFIG" ]; then
+    awk -v tpl="$template" '
+      BEGIN {
+        while ((getline line < tpl) > 0) {
+          if (line ~ /^user_rules:/) { intra = 1; continue }
+          if (intra && line ~ /^[a-zA-Z_]+:/) intra = 0
+          if (intra) { n++; block[n] = line }
+        }
+      }
+      /^user_rules:/ {
+        print "user_rules:"
+        for (i = 1; i <= n; i++) print block[i]
+        inserted = 1
+        skip = 1
+        next
+      }
+      skip == 1 && /^[a-zA-Z_]+:/ { skip = 0 }
+      skip == 1 { next }
+      { print }
+      END {
+        if (!inserted) {
+          print "user_rules:"
+          for (i = 1; i <= n; i++) print block[i]
+        }
+      }
+    ' "$CONFIG" > "$CONFIG.rules-sync.$$" 2>/dev/null || { rm -f "$CONFIG.rules-sync.$$"; return 1; }
+    chmod 600 "$CONFIG.rules-sync.$$" 2>/dev/null || :
+    mv "$CONFIG.rules-sync.$$" "$CONFIG" || { rm -f "$CONFIG.rules-sync.$$"; return 1; }
+  fi
+  # 安装时清空版本标记,强制下次启动再复制一次,避免运行中的 AGH 把文件回写覆盖。
+  state_set rules_version ''
+  return 0
+}
+
+sync_rules_on_update() {
+  local version
+  version=$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | head -n 1)
+  [ -n "$version" ] || return 0
+  [ "$(state_get rules_version)" = "$version" ] && return 0
+  if copy_template_rules; then
+    state_set rules_version "$version"
+    log "module rules synced for version $version"
+  fi
+  return 0
+}
+
+# ==============================================================================
+# 网络故障保护
+# ==============================================================================
+# 当 Android 系统报告网络未验证（无互联网）时，自动停止过滤并恢复系统网络
+# 触发条件：
+#   - Wi-Fi 或移动网络已连接
+#   - 系统网络没有 VALIDATED 状态
+#   - 同一网络持续异常约 10 秒
+#   - 不是认证门户（CAPTIVE_PORTAL）
+#   - 不是部分连接（PARTIAL_CONNECTIVITY）
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# capture_network_failsafe_state - 捕获网络故障现场快照
+# 功能：收集全面的网络状态信息，用于问题诊断
+# 保存内容：
+#   - 系统连接状态（dumpsys connectivity）
+#   - DNS 解析器状态（dumpsys netd）
+#   - 路由表（ip route）
+#   - 网络接口（ip addr）
+#   - iptables 规则
+#   - 系统 DNS/代理设置
+#   - 进程列表
+#   - 模块状态和日志
+# ------------------------------------------------------------------------------
 capture_network_failsafe_state() {
   local target=$DATA_DIR/logs/network-failsafe-state.log
   local temp=$target.tmp.$$
   mkdir -p "$DATA_DIR/logs" || return 1
   {
     echo "===== AdGuard Home network failsafe snapshot ====="
-    echo "timestamp=$(date '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null)"
+    echo "timestamp=$(portable_date '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null)"
     echo "boot_id=$(current_boot_id)"
     echo "uid=$(id 2>/dev/null)"
     echo "===== connectivity ====="
@@ -104,11 +422,8 @@ capture_network_failsafe_state() {
     echo "===== module control status ====="
     "$0" status 2>&1 || true
     "$PROXY_CTL" status 2>&1 || true
-    echo "===== resolver state files ====="
-    for file in "$RESOLVER_STATE" "$RESOLVER_BLOCKED" "$RESOLVER_HEALTH" "$DATA_DIR/disabled" "$DATA_DIR/agh.pid" "$DATA_DIR/agh.launch"; do
-      echo "--- $file"
-      if [ -f "$file" ]; then cat "$file" 2>&1; else echo "<missing>"; fi
-    done
+    echo "===== runtime state ($STATE_FILE) ====="
+    if [ -f "$STATE_FILE" ]; then cat "$STATE_FILE" 2>&1; else echo "<missing>"; fi
     echo "===== recent module logs ====="
     for file in "$DATA_DIR/logs"/*.log; do
       [ "$file" = "$target" ] && continue
@@ -121,15 +436,21 @@ capture_network_failsafe_state() {
   mv "$temp" "$target"
 }
 
+# ------------------------------------------------------------------------------
+# network_failsafe - 执行网络故障保护
+# 功能：当检测到网络异常时，停止过滤并恢复系统网络
+# 流程：
+#   1. 捕获网络状态快照（用于诊断）
+#   2. 停止 AdGuard Home 服务
+#   3. 恢复系统 DNS 设置
+#   4. 移除 iptables 规则
+#   5. 创建告警文件通知用户
+# ------------------------------------------------------------------------------
 network_failsafe() {
   capture_network_failsafe_state || log "failed to capture complete network failsafe snapshot"
   if stop; then
-    {
-      echo "当前网络状态异常，可能是我们的过滤问题，我们已经先行退出了。"
-      echo "问题反馈请在管理器关于页面加入交流群联系开发者。"
-    } > "$NETWORK_ALERT.tmp" || return 1
-    chmod 600 "$NETWORK_ALERT.tmp" 2>/dev/null
-    mv "$NETWORK_ALERT.tmp" "$NETWORK_ALERT" || return 1
+    # 记录告警标记(内容固定,统一写进运行时状态文件)
+    state_set network_alert active || return 1
     log "Android reported an unvalidated connected network; filtering was stopped and system networking restored"
     echo network-failsafe-active
     return 0
@@ -139,28 +460,73 @@ network_failsafe() {
   return 1
 }
 
+# ------------------------------------------------------------------------------
+# network_alert - 获取网络告警信息
+# 功能：返回告警文件内容，供管理器 App 显示
+# ------------------------------------------------------------------------------
 network_alert() {
-  [ -s "$NETWORK_ALERT" ] && cat "$NETWORK_ALERT"
+  [ "$(state_get network_alert)" = "active" ] || return 0
+  echo "当前网络状态异常，可能是我们的过滤问题，我们已经先行退出了。"
+  echo "问题反馈请在管理器关于页面加入交流群联系开发者。"
 }
 
+# ------------------------------------------------------------------------------
+# network_alert_ack - 确认网络告警
+# 功能：删除告警文件，表示用户已知晓
+# ------------------------------------------------------------------------------
 network_alert_ack() {
-  rm -f "$NETWORK_ALERT"
+  state_set network_alert ''
   echo network-alert-acknowledged
 }
 
+# ==============================================================================
+# 网络状态检测函数
+# ==============================================================================
+# 用于检测 Android 设备的网络连接状态
+# 通过解析 dumpsys connectivity 输出获取网络信息
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# active_physical_network_state - 获取活动物理网络状态
+# 功能：检测当前活动的物理网络（非VPN）及其验证状态
+# 返回：<netid> <transport> <validated> <portal>
+#   - netid: 网络 ID
+#   - transport: wifi/cellular/ethernet
+#   - validated: 0/1 是否通过互联网验证
+#   - portal: 0/1 是否是认证门户
+# 用途：网络故障保护判断是否需要触发 failsafe
+# ------------------------------------------------------------------------------
 active_physical_network_state() {
   local snapshot=/dev/.agh-network-watch.$$ netid flags transport validated portal
   dumpsys connectivity > "$snapshot" 2>/dev/null || { rm -f "$snapshot"; return 1; }
-  netid=$(sed -n 's/^[[:space:]]*Active default network:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' "$snapshot" | head -n 1)
+  netid=$(active_network_id "$snapshot")
   case "$netid" in ''|*[!0-9]*) rm -f "$snapshot"; return 1 ;; esac
   flags=$(active_network_block "$snapshot" "$netid" | awk '
-    /WIFI|TRANSPORT_WIFI/ { wifi=1 }
-    /CELLULAR|TRANSPORT_CELLULAR/ { cellular=1 }
-    /IS_VALIDATED|&VALIDATED([& ]|$)/ { validated=1 }
-    /IS_CAPTIVE_PORTAL|CAPTIVE_PORTAL|PARTIAL_CONNECTIVITY/ { portal=1 }
+    {
+      upper = toupper($0)
+      if (upper ~ /NETWORKREQUEST[[:space:]]*\[/) next
+      transports = upper
+      if (sub(/^.*TRANSPORTS:[[:space:]]*/, "", transports)) {
+        sub(/[[:space:]]+CAPABILITIES:.*/, "", transports)
+        if (transports ~ /(^|[|,[:space:]])VPN($|[|,[:space:]])/) vpn=1
+        if (transports ~ /(^|[|,[:space:]])WIFI($|[|,[:space:]])/) wifi=1
+        if (transports ~ /(^|[|,[:space:]])CELLULAR($|[|,[:space:]])/) cellular=1
+        if (transports ~ /(^|[|,[:space:]])ETHERNET($|[|,[:space:]])/) ethernet=1
+      }
+      if (upper ~ /NI\{VPN([[:space:]]|\[|$)/ ||
+          upper ~ /TYPE:[[:space:]]*VPN/ ||
+          upper ~ /TRANSPORT_VPN/ ||
+          upper ~ /VPNTRANSPORTINFO/ ||
+          upper ~ /IS_VPN/) vpn=1
+      if (upper ~ /CAPABILITIES:[^]]*[&[:space:]]INTERNET([&[:space:]]|$)/) internet=1
+      if (upper ~ /IS_VALIDATED|&VALIDATED([&[:space:]]|$)/) validated=1
+      if (upper ~ /IS_CAPTIVE_PORTAL|CAPTIVE_PORTAL|PARTIAL_CONNECTIVITY/) portal=1
+    }
     END {
+      if (vpn || !internet) exit
       if (wifi) transport="wifi"
       else if (cellular) transport="cellular"
+      else if (ethernet) transport="ethernet"
       if (transport != "") print transport, validated + 0, portal + 0
     }
   ')
@@ -171,11 +537,122 @@ active_physical_network_state() {
   echo "$netid $transport $validated $portal"
 }
 
+# ------------------------------------------------------------------------------
+# cellular_signal_level - 读取当前 SIM 的信号等级
+# 返回：0 = 无信号或读取失败，1..4 = 有信号，越大越强，255 = 未知
+# 实现：解析 dumpsys telephony.registry，匹配 SignalStrength / Lte / getLevel。
+# 注意：双卡设备只取当前活跃数据卡，不影响 Wi-Fi / 以太网场景。
+# ------------------------------------------------------------------------------
+cellular_signal_level() {
+  local snapshot=${1:-/dev/.agh-signal-read.$$}
+  local level line
+  dumpsys telephony.registry > "$snapshot" 2>/dev/null || { rm -f "$snapshot"; return 0; }
+  # 不同 OEM 行尾格式不一致,直接抓 "getLevel=" / "level=" 后的整数。
+  # BusyBox awk 不支持 match(str, regex, array),故用 split + 手工比对。
+  level=255
+  while IFS= read -r line; do
+    case "$line" in
+      *getLevel=*|*level=*|*Lte*Rsrp=*)
+        level=$(printf '%s' "$line" | tr ';,(){}' '\n' | sed -n 's/^[[:space:]]*\(getLevel\|level\|mLevel\)=\([0-9][0-9]*\).*/\2/p' | sed -n '1p')
+        case "$level" in ''|*[!0-9]*) level=255 ;; esac
+        ;;
+    esac
+  done < "$snapshot"
+  rm -f "$snapshot"
+  echo "$level"
+}
+
+# ------------------------------------------------------------------------------
+# ipv4_reachable - 不依赖 DNS 直接 ping 公网 IP，验证 IP 层连通性
+# 用于区分"网络层断网"与"DNS 解析失败"：若 1.1.1.1 都不通，
+# 那显然是运营商 / 信号问题，不应触发本模块的 failsafe。
+# ------------------------------------------------------------------------------
+ipv4_reachable() {
+  local host=${1:-1.1.1.1}
+  local first
+  if command -v timeout >/dev/null 2>&1; then
+    first=$(timeout 4 ping -c 1 -W 2 -q "$host" 2>&1 | sed -n '1p')
+  else
+    first=$(ping -c 1 -W 2 -q "$host" 2>&1 | sed -n '1p')
+  fi
+  case "$first" in
+    "PING "*"("*")"*) return 0 ;;
+  esac
+  return 1
+}
+
+# ------------------------------------------------------------------------------
+# ipv6_reachable - 检测当前是否有可用的 IPv6 出口
+# 用于诊断双栈下 IPv6-only 故障：若 IPv4 仍可达但 IPv6 不可达，
+# 不应将整网不可用归因于本模块。
+# ------------------------------------------------------------------------------
+ipv6_reachable() {
+  local first
+  if command -v timeout >/dev/null 2>&1; then
+    first=$(timeout 4 ping6 -c 1 -W 2 -q 2606:4700:4700::1111 2>&1 | sed -n '1p')
+  else
+    first=$(ping6 -c 1 -W 2 -q 2606:4700:4700::1111 2>&1 | sed -n '1p')
+  fi
+  case "$first" in
+    "PING "*"("*")"*) return 0 ;;
+  esac
+  return 1
+}
+
+# ------------------------------------------------------------------------------
+# network_diagnose - 在考虑 failsafe 前给出一份诊断结论。
+# 仅打印诊断，不修改状态；network_watch 根据返回的"skip_reason"决定是否跳过。
+# 返回："ok" / "no-signal" / "no-ipv4" / "ipv6-only-loss" / "needs-failsafe"
+# ------------------------------------------------------------------------------
+network_diagnose() {
+  local transport=$1 netid=$2 validated=$3 reason
+  reason=needs-failsafe
+  if [ "$transport" = "cellular" ]; then
+    local signal
+    signal=$(cellular_signal_level)
+    case "$signal" in
+      0)
+        log "network diagnostic netId=$netid transport=$transport signal=0/255: skipping failsafe because cellular modem reports no signal"
+        reason=no-signal
+        ;;
+    esac
+  fi
+  if [ "$reason" = needs-failsafe ]; then
+    if ipv4_reachable; then
+      log "network diagnostic netId=$netid transport=$transport: IPv4 IP-level reachability is intact despite Android unvalidated flag; treating as network-side false positive"
+      reason=no-ipv4
+    elif ipv6_reachable; then
+      log "network diagnostic netId=$netid transport=$transport: IPv6 reachable but IPv4 dead; this is a single-stack outage, not a module fault"
+      reason=ipv6-only-loss
+    fi
+  fi
+  printf '%s\n' "$reason"
+}
+
+# ------------------------------------------------------------------------------
+# network_watch - 网络监控主循环（由 aghbridge 启动的独立进程）
+# 功能：每 5 秒检查一次网络状态，当检测到网络异常时触发故障保护
+#
+# 故障保护触发条件（全部满足）：
+#   1. Wi-Fi 或移动网络已连接
+#   2. 系统网络没有 VALIDATED 状态
+#   3. 同一网络持续异常约 10 秒
+#   4. 不是认证门户（CAPTIVE_PORTAL）
+#   5. 不是部分连接（PARTIAL_CONNECTIVITY）
+#   6. (新增) 蜂窝无信号、IP 层完全不可达、单栈 IPv6-only 故障都不算本模块的锅
+#
+# 触发后：
+#   1. 生成网络状态快照
+#   2. 停止过滤服务
+#   3. 恢复系统 DNS
+#   4. 通知管理器 App
+# ------------------------------------------------------------------------------
 network_watch() {
   local state netid transport validated portal now failure_id= failure_since=0 elapsed
+  local skip_reason
   trap 'exit 0' HUP INT TERM
   while :; do
-    if [ -f "$DISABLED_FILE" ] || ! is_running; then
+    if [ -n "$(state_get disabled_boot_id)" ] || ! is_running; then
       failure_id= failure_since=0
     else
       state=$(active_physical_network_state) || state=
@@ -188,7 +665,7 @@ network_watch() {
           [ "$portal" = 1 ] && log "skipping network failsafe for captive portal or partial-connectivity network netId=$netid"
           failure_id= failure_since=0
         else
-          now=$(date +%s)
+          now=$(portable_date +%s)
           case "$now" in ''|*[!0-9]*) now=0 ;; esac
           if [ "$failure_id" != "$netid" ] || [ "$failure_since" -le 0 ]; then
             failure_id=$netid
@@ -197,16 +674,23 @@ network_watch() {
           elapsed=$((now - failure_since))
           log "unvalidated $transport network netId=$netid duration=${elapsed}s/10s"
           if [ "$elapsed" -ge 10 ]; then
-            if network_failsafe; then
-              am start -W -a android.intent.action.VIEW -n com.adguardhome.android/.ManagerActivity \
-                --ez network_failsafe true >/dev/null 2>&1 || log "Android blocked the network alert activity launch"
+            skip_reason=$(network_diagnose "$transport" "$netid" "$validated")
+            if [ "$skip_reason" != "needs-failsafe" ]; then
+              log "skipping failsafe for netId=$netid: diagnosis=$skip_reason"
+              # 诊断证据已表明不是本模块的锅,清除计时器但保留下一次 5 秒周期的探测。
+              failure_id= failure_since=0
+            else
+              if network_failsafe; then
+                am start -W -a android.intent.action.VIEW -n com.adguardhome.android/.ManagerActivity \
+                  --ez network_failsafe true >/dev/null 2>&1 || log "Android blocked the network alert activity launch"
+              fi
+              failure_id= failure_since=0
             fi
-            failure_id= failure_since=0
           fi
         fi
       fi
     fi
-    sleep 5
+    portable_sleep 5
   done
 }
 
@@ -215,14 +699,19 @@ network_watch() {
 # so use the tiny Java helper bundled in the module.  The installed companion
 # APK remains a fallback for source-tree testing and older module packages.
 resolver_helper() {
-  local apk bundled=$MODDIR/system/etc/agh-dns-helper.apk
+  local apk pkg bundled=$MODDIR/system/etc/agh-dns-helper.apk
   if [ -n "$DNS_HELPER_APK" ] && [ -f "$DNS_HELPER_APK" ] && [ -n "$APP_PROCESS" ]; then
     return 0
   fi
   if [ -f "$bundled" ]; then
     apk=$bundled
   else
-    apk=$(pm path com.adguardhome.android 2>/dev/null | sed -n 's/^package://p' | head -n 1)
+    # 当前主包名是 com.adguardhome.android.standard;同时兼容旧包名。
+    for pkg in com.adguardhome.android.standard com.adguardhome.android; do
+      apk=$(pm path "$pkg" 2>/dev/null | sed -n 's/^package://p' | sed -n '1p')
+      [ -n "$apk" ] && [ -f "$apk" ] && break
+      apk=
+    done
   fi
   [ -n "$apk" ] && [ -f "$apk" ] || return 1
   if [ -x /system/bin/app_process64 ]; then
@@ -260,54 +749,73 @@ active_network_id() {
   local source=$1
   local netid
   [ -r "$source" ] || return 1
-  # ConnectivityService may report a VPN's underlying Wi-Fi/mobile network as
-  # the default. DNSResolver is scoped by netId, so prefer a validated VPN
-  # that covers the full app UID range before falling back to the default.
+  # Keep the module resolver on the physical network.  The adapted proxy
+  # configuration sends client DNS to AdGuard Home itself; binding Android's
+  # resolver to the VPN netId can make proxy startup depend on its own DNS.
   netid=$(awk '
-    function emit() {
-      if (id != "" && vpn && validated && all_uids) {
-        print id
-        exit
+    function inspect(line, upper, transports) {
+      upper = toupper(line)
+      if (upper ~ /NETWORKREQUEST[[:space:]]*\[/) return
+      transports = upper
+      if (sub(/^.*TRANSPORTS:[[:space:]]*/, "", transports)) {
+        sub(/[[:space:]]+CAPABILITIES:.*/, "", transports)
+        if (transports ~ /(^|[|,[:space:]])VPN($|[|,[:space:]])/) vpn = 1
+        if (transports ~ /(^|[|,[:space:]])(WIFI|CELLULAR|ETHERNET)($|[|,[:space:]])/) physical = 1
       }
+      if (upper ~ /NI\{(WIFI|CELLULAR|MOBILE|ETHERNET)([[:space:]]|\[|$)/ ||
+          upper ~ /TRANSPORT_(WIFI|CELLULAR|ETHERNET)/) physical = 1
+      if (upper ~ /NI\{VPN([[:space:]]|\[|$)/ ||
+          upper ~ /TYPE:[[:space:]]*VPN/ ||
+          upper ~ /TRANSPORT_VPN/ ||
+          upper ~ /VPNTRANSPORTINFO/ ||
+          upper ~ /IS_VPN/) vpn = 1
+      if (upper ~ /CAPABILITIES:[^]]*[&[:space:]]INTERNET([&[:space:]]|$)/) internet = 1
+      if (upper ~ /IS_VALIDATED|&VALIDATED([&[:space:]]|$)/) validated = 1
+      if (upper ~ /TRANSPORT_PRIMARY/) primary = 1
+    }
+    function remember() {
+      # IMS/MMS/EIMS/SUPL networks are cellular and may be validated or marked
+      # primary, but they are not general Internet transports and often have
+      # no DNS servers.  Selecting one breaks AGH upstream connectivity.
+      if (id == "" || !physical || vpn || !internet) return
+      if (fallback == "") fallback = id
+      if (validated && healthy == "") healthy = id
+      if (primary) preferred = id
+      if (id == default_id) active = id
+    }
+    /^[[:space:]]*Active default network:[[:space:]]*[0-9]/ {
+      default_id = $0
+      sub(/^.*Active default network:[[:space:]]*/, "", default_id)
+      sub(/[^0-9].*$/, "", default_id)
     }
     /NetworkAgentInfo\{network\{/ {
-      emit()
+      remember()
       id = $0
       sub(/^.*NetworkAgentInfo\{network\{/, "", id)
       sub(/\}.*/, "", id)
-      vpn = validated = all_uids = 0
+      physical = vpn = internet = validated = primary = 0
     }
-    /VPN CONNECTED|IS_VPN|Transports: VPN/ { vpn = 1 }
-    /IS_VALIDATED|&VALIDATED([& ]|$)/ { validated = 1 }
-    /Uids: <\{0-99999\}>|Uids: <\{0-99999\},/ { all_uids = 1 }
-    END { emit() }
-  ' "$source" | head -n 1)
+    id != "" && /^[[:space:]]+Requests:/ {
+      remember()
+      id = ""
+      next
+    }
+    id != "" { inspect($0) }
+    END {
+      remember()
+      if (active != "") print active
+      else if (preferred != "") print preferred
+      else if (healthy != "") print healthy
+      else if (fallback != "") print fallback
+    }
+  ' "$source")
   case "$netid" in
     [0-9]*) echo "$netid"; return 0 ;;
   esac
-  netid=$(sed -n 's/^[[:space:]]*Active default network:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' "$source" | head -n 1)
-  case "$netid" in
-    [0-9]*) echo "$netid"; return 0 ;;
-  esac
-  # Older Android releases may omit the summary line.  Fall back to the
-  # validated primary transport, then to the first Wi-Fi/cellular network.
-  awk '
-    function id(line, value) {
-      value = line
-      sub(/^.*NetworkAgentInfo\{network\{/, "", value)
-      sub(/\}.*/, "", value)
-      return value
-    }
-    index($0, "NetworkAgentInfo{network{") {
-      if (index($0, "TRANSPORT_PRIMARY") && index($0, "IS_VALIDATED")) {
-        print id($0)
-        found = 1
-        exit
-      }
-      if (fallback == "" && (index($0, "WIFI") || index($0, "CELLULAR"))) fallback = id($0)
-    }
-    END { if (!found && fallback != "") print fallback }
-  ' "$source" | head -n 1
+  # Never fall back to the active default blindly.  During proxy startup that
+  # network is commonly a TUN/VPN whose inherited transport also contains
+  # WIFI or CELLULAR.  Skipping takeover is fail-open and preserves access.
+  return 1
 }
 
 active_network_block() {
@@ -319,6 +827,8 @@ active_network_block() {
       if (capture) exit
       if (index($0, needle)) capture = 1
     }
+    capture && /^[[:space:]]+Requests:/ { exit }
+    capture && /NetworkRequest[[:space:]]*\[/ { exit }
     capture { print }
   ' "$source"
 }
@@ -366,86 +876,90 @@ current_boot_id() {
 }
 
 state_boot_id() {
-  sed -n 's/^boot_id=//p' "$RESOLVER_STATE" 2>/dev/null | head -n 1
+  state_get resolver_boot_id
 }
 
 state_network_id() {
-  sed -n 's/^netid=//p' "$RESOLVER_STATE" 2>/dev/null | head -n 1
+  state_get resolver_netid
 }
 
 state_active() {
-  sed -n 's/^active=//p' "$RESOLVER_STATE" 2>/dev/null | tail -n 1
+  state_get resolver_active
+}
+
+resolver_state_exists() {
+  [ -n "$(state_get resolver_netid)" ]
+}
+
+resolver_clear_state() {
+  state_set resolver_boot_id ''
+  state_set resolver_netid ''
+  state_set resolver_dns ''
+  state_set resolver_active ''
+  state_set resolver_blocked ''
+  state_set resolver_health_boot_id ''
+  state_set resolver_health_netid ''
+  state_set resolver_health_checked_at ''
+}
+
+iptables_fallback_active() {
+  [ -n "$(state_get iptables_fallback_netid)" ]
+}
+
+iptables_fallback_clear() {
+  state_set iptables_fallback_netid ''
+  state_set iptables_fallback_started ''
 }
 
 resolver_blocked_for() {
-  local netid=$1
-  local boot
-  [ -s "$RESOLVER_BLOCKED" ] || return 1
-  boot=$(current_boot_id)
-  grep -qx "boot_id=$boot" "$RESOLVER_BLOCKED" 2>/dev/null &&
-    grep -qx "netid=$netid" "$RESOLVER_BLOCKED" 2>/dev/null
+  local entry
+  entry=$(state_get resolver_blocked)
+  [ -n "$entry" ] || return 1
+  [ "$entry" = "$(current_boot_id)|$1" ]
 }
 
 resolver_mark_blocked() {
-  local netid=$1
-  local temp=$RESOLVER_BLOCKED.tmp.$$
-  {
-    echo "boot_id=$(current_boot_id)"
-    echo "netid=$netid"
-  } > "$temp" || return 1
-  chmod 600 "$temp"
-  mv "$temp" "$RESOLVER_BLOCKED"
+  state_set resolver_blocked "$(current_boot_id)|$1"
 }
 
 resolver_snapshot() {
   local source=$1
   local netid=$2
-  local server count=0 temp
+  local server count=0 list=
   [ -r "$source" ] && [ -n "$netid" ] || return 1
-  temp=$RESOLVER_STATE.tmp.$$
-  rm -f "$temp"
-  {
-    echo "version=2"
-    echo "boot_id=$(current_boot_id)"
-    echo "netid=$netid"
-    echo "active=0"
-    for server in $(active_network_servers "$source" "$netid"); do
-      if is_usable_dns "$server"; then
-        echo "dns=$server"
-        count=$((count + 1))
+  for server in $(active_network_servers "$source" "$netid"); do
+    if is_usable_dns "$server"; then
+      if [ -z "$list" ]; then
+        list=$server
+      else
+        list="$list|$server"
       fi
-    done
-  } > "$temp" || return 1
+      count=$((count + 1))
+    fi
+  done
   if [ "$count" -eq 0 ]; then
-    rm -f "$temp"
     log "no usable system DNS found for netid=$netid; resolver takeover skipped"
     return 1
   fi
-  chmod 600 "$temp"
-  mv "$temp" "$RESOLVER_STATE"
+  state_set resolver_boot_id "$(current_boot_id)"
+  state_set resolver_netid "$netid"
+  state_set resolver_dns "$list"
+  state_set resolver_active 0
   log "saved system DNS for netid=$netid ($count server(s))"
   return 0
 }
 
 resolver_mark_active() {
-  local temp=$RESOLVER_STATE.tmp.$$
-  [ -s "$RESOLVER_STATE" ] || return 1
-  awk '
-    /^active=/ && !done { print "active=1"; done=1; next }
-    { print }
-    END { if (!done) print "active=1" }
-  ' "$RESOLVER_STATE" > "$temp" || return 1
-  chmod 600 "$temp"
-  mv "$temp" "$RESOLVER_STATE"
+  resolver_state_exists || return 1
+  state_set resolver_active 1
 }
 
 resolver_health_recent() {
   local netid=$1 now checked age
-  [ -s "$RESOLVER_HEALTH" ] || return 1
-  grep -qx "boot_id=$(current_boot_id)" "$RESOLVER_HEALTH" 2>/dev/null || return 1
-  grep -qx "netid=$netid" "$RESOLVER_HEALTH" 2>/dev/null || return 1
-  checked=$(sed -n 's/^checked_at=//p' "$RESOLVER_HEALTH" 2>/dev/null | head -n 1)
-  now=$(date +%s 2>/dev/null)
+  [ "$(state_get resolver_health_boot_id)" = "$(current_boot_id)" ] || return 1
+  [ "$(state_get resolver_health_netid)" = "$netid" ] || return 1
+  checked=$(state_get resolver_health_checked_at)
+  now=$(portable_date +%s 2>/dev/null)
   [ -n "$checked" ] && [ -n "$now" ] || return 1
   case "$checked:$now" in *[!0-9:]*) return 1 ;; esac
   age=$((now - checked))
@@ -453,14 +967,9 @@ resolver_health_recent() {
 }
 
 resolver_mark_healthy() {
-  local netid=$1 temp=$RESOLVER_HEALTH.tmp.$$
-  {
-    echo "boot_id=$(current_boot_id)"
-    echo "netid=$netid"
-    echo "checked_at=$(date +%s 2>/dev/null)"
-  } > "$temp" || return 1
-  chmod 600 "$temp"
-  mv "$temp" "$RESOLVER_HEALTH"
+  state_set resolver_health_boot_id "$(current_boot_id)"
+  state_set resolver_health_netid "$1"
+  state_set resolver_health_checked_at "$(portable_date +%s 2>/dev/null)"
 }
 
 local_dns_ready() {
@@ -476,7 +985,7 @@ dns_probe_host() {
   else
     output=$(ping -c 1 -W 2 "$host" 2>&1)
   fi
-  first=$(printf '%s\n' "$output" | head -n 1)
+  first=$(printf '%s\n' "$output" | sed -n '1p')
   case "$first" in
     PING*"("*")"*) return 0 ;;
   esac
@@ -492,7 +1001,7 @@ dns_probe_blocked() {
   else
     output=$(ping -c 1 -W 2 "$host" 2>&1)
   fi
-  first=$(printf '%s\n' "$output" | head -n 1)
+  first=$(printf '%s\n' "$output" | sed -n '1p')
   case "$first" in
     PING*"("*")"*)
       log "DNS filtering probe unexpectedly resolved $host: $first"
@@ -517,23 +1026,106 @@ system_dns_probe() {
     dns_probe_host www.iana.org
 }
 
+# ==============================================================================
+# DNS 接管管理函数
+# ==============================================================================
+# 通过 Android DNSResolver API 将系统 DNS 指向本地 AdGuard Home
+# 实现原理：
+#   1. 保存当前网络的原始 DNS 服务器
+#   2. 使用 DnsSetter (Java helper) 将 DNS 设置为 127.0.0.1
+#   3. AdGuard Home 监听 127.0.0.1:5353 处理 DNS 请求
+#   4. iptables 规则将 127.0.0.1:53 重定向到 127.0.0.1:5353
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# resolver_restore - 恢复系统原始 DNS 设置
+# 功能：将 DNS 恢复为 AdGuard Home 接管前保存的原始服务器
+# 流程：
+#   1. 读取保存的原始 DNS 服务器列表
+#   2. 使用 DnsSetter 恢复 DNS 设置
+#   3. 刷新 DNS 缓存
+#   4. 清理状态文件
+# 返回：0 = 成功，1 = 失败
+# ------------------------------------------------------------------------------
 resolver_restore() {
-  local netid servers
-  if [ -s "$RESOLVER_STATE" ] && [ "$(state_active)" = "1" ]; then
-    netid=$(state_network_id)
-    servers=$(sed -n 's/^dns=//p' "$RESOLVER_STATE")
-    if [ -n "$netid" ] && [ -n "$servers" ]; then
-      resolver_call "$netid" $servers || return 1
-      # Android may keep negative answers and the old resolver socket alive
-      # after IDnsResolver is restored.  Flush both framework and netd caches
-      # before reporting recovery complete.
+  local saved_netid saved_servers current_netid snapshot attempt netid ok=0
+  saved_netid=$(state_network_id)
+  saved_servers=$(state_get resolver_dns | tr '|' ' ')
+  snapshot=/dev/.agh-resolver-restore.$$
+  if connectivity_snapshot "$snapshot"; then
+    current_netid=$(active_network_id "$snapshot" 2>/dev/null)
+  fi
+  rm -f "$snapshot"
+
+  if [ "$(state_active)" = "1" ] || [ -n "$saved_netid" ]; then
+    # 1) 原 netid + 原 DNS,重试 3 次
+    if [ -n "$saved_netid" ] && [ -n "$saved_servers" ]; then
+      attempt=1
+      while [ "$attempt" -le 3 ]; do
+        if resolver_call "$saved_netid" $saved_servers; then ok=1; break; fi
+        portable_sleep 1
+        attempt=$((attempt + 1))
+      done
+    fi
+
+    # 2) 网络已切换:把原 DNS 应用到当前 netid
+    if [ "$ok" -eq 0 ] && [ -n "$current_netid" ] && [ "$current_netid" != "$saved_netid" ] && [ -n "$saved_servers" ]; then
+      attempt=1
+      while [ "$attempt" -le 3 ]; do
+        if resolver_call "$current_netid" $saved_servers; then ok=1; break; fi
+        portable_sleep 1
+        attempt=$((attempt + 1))
+      done
+    fi
+
+    # 3) 清除 netd DNS 覆盖,回退到运营商/DHCP DNS(不依赖 Java 辅助器)
+    if [ "$ok" -eq 0 ]; then
+      for netid in "$saved_netid" "$current_netid"; do
+        [ -n "$netid" ] || continue
+        if cmd netd resolver clearnetdns "$netid" >/dev/null 2>&1; then
+          ok=1
+          log "resolver override cleared for netid=$netid; using network DNS"
+          break
+        fi
+        if ndc resolver clearnetdns "$netid" >/dev/null 2>&1; then
+          ok=1
+          log "resolver override cleared for netid=$netid via ndc; using network DNS"
+          break
+        fi
+      done
+    fi
+
+    # 4) 最后兜底:写入公共 DNS,保证停止后不断网
+    if [ "$ok" -eq 0 ]; then
+      for netid in "$current_netid" "$saved_netid"; do
+        [ -n "$netid" ] || continue
+        if resolver_call "$netid" 223.5.5.5 119.29.29.29 114.114.114.114; then
+          ok=1
+          log "restored fallback public DNS for netid=$netid"
+          break
+        fi
+        if cmd netd resolver setnetdns "$netid" "" 223.5.5.5 119.29.29.29 >/dev/null 2>&1; then
+          ok=1
+          log "restored fallback public DNS for netid=$netid via netd"
+          break
+        fi
+      done
+    fi
+
+    # 刷新缓存,避免老解析结果残留
+    for netid in "$saved_netid" "$current_netid"; do
+      [ -n "$netid" ] || continue
       ndc resolver flushnet "$netid" >/dev/null 2>&1 || :
-      cmd netd resolver clearnetdns "$netid" >/dev/null 2>&1 || :
-      am broadcast -a android.intent.action.CLEAR_DNS_CACHE >/dev/null 2>&1 || :
-      sleep 1
+    done
+    am broadcast -a android.intent.action.CLEAR_DNS_CACHE >/dev/null 2>&1 || :
+    portable_sleep 1
+
+    if [ "$ok" -eq 0 ]; then
+      log "resolver restore failed for netid=$saved_netid/current=$current_netid"
+      return 1
     fi
   fi
-  rm -f "$RESOLVER_STATE" "$RESOLVER_BLOCKED" "$RESOLVER_HEALTH"
+  resolver_clear_state
   return 0
 }
 
@@ -552,6 +1144,25 @@ network_is_wifi() {
   return "$result"
 }
 
+# ------------------------------------------------------------------------------
+# resolver_takeover - 执行 DNS 接管
+# 功能：将当前网络的 DNS 指向本地 AdGuard Home (127.0.0.1)
+#
+# 流程：
+#   1. 获取当前活动网络的 netid
+#   2. 检查本地 DNS 是否就绪（AdGuard Home 是否监听 5353 端口）
+#   3. 检查该 netid 是否之前验证失败过（blocked 标记）
+#   4. 保存当前网络的原始 DNS 服务器
+#   5. 使用 DnsSetter 设置 DNS 为 127.0.0.1
+#   6. 验证 DNS 是否正常工作
+#   7. 如果验证失败，进入 iptables 回退模式
+#
+# iptables 回退模式：
+#   当 DNSResolver 验证失败时，保留 iptables 规则
+#   即使系统 DNS 指向外部服务器，DNS 请求仍会被 iptables 重定向到本地
+#
+# 返回：0 = 成功（包括 iptables 回退），1 = 失败，2 = 跳过
+# ------------------------------------------------------------------------------
 resolver_takeover() {
   local snapshot=${AGH_CONNECTIVITY_TEMP:-/dev/.agh-connectivity.$$}
   local netid saved boot saved_boot
@@ -573,24 +1184,24 @@ resolver_takeover() {
     log "resolver takeover skipped after a failed verification for netid=$netid"
     return 2
   fi
-  if [ -s "$RESOLVER_STATE" ]; then
+  if resolver_state_exists; then
     boot=$(current_boot_id)
     saved_boot=$(state_boot_id)
     if [ -z "$saved_boot" ] || { [ -n "$boot" ] && [ "$saved_boot" != "$boot" ]; }; then
-      rm -f "$RESOLVER_STATE"
+      resolver_clear_state
       log "discarded incomplete or stale resolver state before takeover"
     fi
   fi
   saved=$(state_network_id)
-  if [ -s "$RESOLVER_STATE" ] && [ "$saved" != "$netid" ]; then
+  if resolver_state_exists && [ "$saved" != "$netid" ]; then
     # netd normally removes the old network together with its resolver state.
     # A restore may therefore fail after switching Wi-Fi/mobile data; do not
     # let a dead netId permanently prevent takeover of the new active network.
     resolver_restore || {
       log "discarded resolver state for inactive netid=$saved"
-      rm -f "$RESOLVER_STATE"
+      resolver_clear_state
     }
-  elif [ -s "$RESOLVER_STATE" ]; then
+  elif resolver_state_exists; then
     # LinkProperties intentionally continues to show DHCP DNS even after an
     # IDnsResolver override.  Older builds mistook that for takeover loss and
     # restored the router DNS on every sync, creating a recurring leak window.
@@ -608,7 +1219,7 @@ resolver_takeover() {
     fi
     log "system resolver filtering path was lost; reasserting localhost for netid=$netid"
   fi
-  if [ ! -s "$RESOLVER_STATE" ]; then
+  if ! resolver_state_exists; then
     resolver_snapshot "$snapshot" "$netid" || {
       rm -f "$snapshot"
       return 1
@@ -634,21 +1245,28 @@ resolver_takeover() {
     fi
     return 1
   fi
-  sleep 1
+  portable_sleep 1
   if system_dns_probe; then
-    rm -f "$RESOLVER_BLOCKED"
+    state_set resolver_blocked ''
+    iptables_fallback_clear
     resolver_mark_healthy "$netid" >/dev/null 2>&1 || :
     log "DNSResolver netid=$netid -> 127.0.0.1 (verified)"
     return 0
   fi
-  log "DNSResolver takeover broke system DNS for netid=$netid; rolling back"
-  remove_iptables_rules
+  log "DNSResolver takeover broke system DNS for netid=$netid; falling back to iptables-only mode"
+  # Keep iptables rules as fallback - they will redirect DNS traffic to AdGuard Home
+  # even when system DNS points to external servers
   if resolver_restore; then
     resolver_mark_blocked "$netid"
+    # Mark iptables fallback mode
+    state_set iptables_fallback_netid "$netid"
+    state_set iptables_fallback_started "$(portable_date '+%Y-%m-%d %H:%M:%S')"
+    log "iptables fallback active: DNS traffic will be intercepted via iptables redirect"
   else
     log "critical: resolver rollback failed for netid=$netid; state retained"
   fi
-  return 1
+  # Return 0 to indicate partial success (iptables mode)
+  return 0
 }
 
 resolver_sync() {
@@ -686,18 +1304,16 @@ hotspot_active() {
 start_app_cleaner() {
   local pid
   [ -x "$APP_CLEANER" ] || return 0
-  if [ -s "$DATA_DIR/appclean.pid" ]; then
-    pid=$(cat "$DATA_DIR/appclean.pid" 2>/dev/null)
-    case "$pid" in
-      ''|*[!0-9]*) ;;
-      *)
-        if kill -0 "$pid" 2>/dev/null; then
-          kill -USR1 "$pid" 2>/dev/null
-          return 0
-        fi
-        ;;
-    esac
-  fi
+  pid=$(state_get appclean_pid 2>/dev/null)
+  case "$pid" in
+    ''|*[!0-9]*|0) ;;
+    *)
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -USR1 "$pid" 2>/dev/null
+        return 0
+      fi
+      ;;
+  esac
   "$APP_CLEANER" >> "$DATA_DIR/logs/appclean.log" 2>&1 &
 }
 
@@ -710,7 +1326,7 @@ reset_browser_network_state() {
   local boot package
   boot=$(current_boot_id)
   [ -n "$boot" ] || return 1
-  [ "$(cat "$BROWSER_RESET_STATE" 2>/dev/null)" = "$boot" ] && return 0
+  [ "$(state_get browser_reset_boot_id)" = "$boot" ] && return 0
   for package in mark.via com.microsoft.emmx; do
     am force-stop "$package" >/dev/null 2>&1
     rm -rf \
@@ -718,8 +1334,7 @@ reset_browser_network_state() {
       "/data/user/0/$package/cache" \
       "/data/media/0/Android/data/$package/cache" 2>/dev/null
   done
-  echo "$boot" > "$BROWSER_RESET_STATE"
-  chmod 600 "$BROWSER_RESET_STATE"
+  state_set browser_reset_boot_id "$boot"
   log "browser network caches reset after DNS takeover"
 }
 
@@ -737,11 +1352,24 @@ build_ca_bundle() {
   local cert_dir
   local cert
   local count
+  local bundle_mtime source_mtime
+  mkdir -p "$DATA_DIR/work" 2>/dev/null
+  # 证书库没变化时直接复用,避免每次启动重写 ~760KB 的合并包。
+  if [ -s "$CA_BUNDLE" ]; then
+    for cert_dir in /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts /apex/com.android.conscrypt/etc/security/cacerts /data/misc/keychain/cacerts-added; do
+      [ -d "$cert_dir" ] || continue
+      bundle_mtime=$(stat -c %Y "$CA_BUNDLE" 2>/dev/null)
+      source_mtime=$(stat -c %Y "$cert_dir" 2>/dev/null)
+      if [ -n "$bundle_mtime" ] && [ -n "$source_mtime" ] && [ "$bundle_mtime" -ge "$source_mtime" ]; then
+        return 0
+      fi
+    done
+  fi
   rm -f "$temp"
 
   # Go does not discover Android's Conscrypt trust store on every ROM.  Build
   # one regular PEM file and expose it only to the AdGuard Home process.
-  for cert_dir in /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts /apex/com.android.conscrypt/etc/security/cacerts; do
+  for cert_dir in /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts /apex/com.android.conscrypt/etc/security/cacerts /data/misc/keychain/cacerts-added; do
     [ -d "$cert_dir" ] || continue
     : > "$temp" || return 1
     count=0
@@ -796,6 +1424,33 @@ remove_legacy_redirects() {
   done
 }
 
+# ==============================================================================
+# iptables 规则管理
+# ==============================================================================
+# 负责管理 DNS 流量重定向规则
+#
+# 规则链结构：
+#   OUTPUT 链 → AGH_DNS / AGH_DNS6 链 → REDIRECT 到 5353 端口
+#
+# 工作原理：
+#   1. 所有从本机发出的目标端口 53 的流量被重定向到 127.0.0.1:5353
+#   2. AdGuard Home 监听 5353 端口处理 DNS 请求
+#   3. 排除特定地址（如 180.184.1.1）避免循环重定向
+#
+# 安全考虑：
+#   - 排除 root 用户的流量，避免模块自身的 DNS 查询被重定向
+#   - 保留热点 DNS 转发器的端口 53
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# setup_chain - 创建并配置 iptables NAT 链
+# 参数：$1 = iptables 工具，$2 = 链名，$@ = 排除的地址列表
+# 功能：
+#   1. 创建专用的 NAT 链
+#   2. 添加排除规则（这些地址的 DNS 不被重定向）
+#   3. 添加重定向规则（端口 53 → 5353）
+#   4. 在 OUTPUT 链中引用该链
+# ------------------------------------------------------------------------------
 setup_chain() {
   local tool=$1
   local chain=$2
@@ -949,6 +1604,16 @@ sync_ipv6_dns_fallback() {
   fi
 }
 
+# ------------------------------------------------------------------------------
+# install_rules - 安装完整的 iptables 规则集
+# 功能：安装所有必要的 iptables 规则，包括：
+#   1. IPv4 NAT 链（AGH_DNS）- 重定向 DNS 到 5353
+#   2. IPv6 NAT 链（AGH_DNS6）- 重定向 IPv6 DNS（如果支持）
+#   3. IPv6 DNS 回退规则 - 在不支持 IPv6 NAT 的设备上阻止 IPv6 DNS
+#   4. 加密 DNS 防护 - 阻止 DoT/DoQ 绕过本地过滤
+#
+# 设计原则：始终从已知的 fail-open 状态开始
+# ------------------------------------------------------------------------------
 install_rules() {
   # Always begin from a known fail-open state.  In particular, never leave a
   # partial jump behind when one of the device's iptables backends rejects it.
@@ -976,6 +1641,15 @@ install_rules() {
   return 0
 }
 
+# ------------------------------------------------------------------------------
+# remove_iptables_rules - 移除所有 iptables 规则
+# 功能：清理所有模块创建的 iptables 规则，包括：
+#   1. IPv4/IPv6 NAT 链
+#   2. 旧版重定向规则
+#   3. IPv6 DNS 回退规则
+#   4. 加密 DNS 防护规则
+# 用途：服务停止、卸载时调用
+# ------------------------------------------------------------------------------
 remove_iptables_rules() {
   remove_chain "$IPTABLES" nat AGH_DNS
   if table_available "$IPTABLES" nat; then
@@ -992,22 +1666,19 @@ remove_iptables_rules() {
 
 is_running() {
   local pid
-  [ -s "$PID_FILE" ] || return 1
-  pid=$(cat "$PID_FILE")
+  pid=$(state_get pid 2>/dev/null)
   case "$pid" in
-    ''|*[!0-9]*) return 1 ;;
+    ''|*[!0-9]*|0) return 1 ;;
   esac
   kill -0 "$pid" 2>/dev/null || return 1
-  [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "AdGuardHome" ]
+  [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "AdGuardHome" ] && return 0
+  # 部分内核/隐藏方案读不到 comm,回退到 cmdline 判断。
+  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "AdGuardHome"
 }
 
 has_current_launch_environment() {
-  local pid
   is_running || return 1
-  pid=$(cat "$PID_FILE")
-  [ -s "$LAUNCH_FILE" ] || return 1
-  grep -qx "pid=$pid" "$LAUNCH_FILE" 2>/dev/null &&
-    grep -qx "ssl_cert_file=$CA_BUNDLE" "$LAUNCH_FILE" 2>/dev/null
+  [ "$(state_get ssl_cert_file)" = "$CA_BUNDLE" ]
 }
 
 ensure_default_dns_filter() {
@@ -1029,7 +1700,7 @@ ensure_default_dns_filter() {
     rm -f "$temp"
     return 2
   }
-  [ -e "$CONFIG.before-default-filter-migration" ] || cp "$CONFIG" "$CONFIG.before-default-filter-migration"
+  [ -e "$CONFIG.bak" ] || cp "$CONFIG" "$CONFIG.bak"
   mv "$temp" "$CONFIG"
   chmod 600 "$CONFIG"
   log "added the default AdGuard DNS Filter to the existing configuration"
@@ -1082,7 +1753,16 @@ migrate_config() {
       else if ($0 ~ /^dns:/) section = "dns"
       else section = ""
     }
-    section == "http" && /^  address:/ { $0 = "  address: 127.0.0.1:3000" }
+    section == "http" && /^  address:/ {
+      http_host = $0
+      sub(/^[^:]*: */, "", http_host)
+      sub(/:.*$/, "", http_host)
+      http_port_num = $0
+      sub(/^.*:/, "", http_port_num)
+      if (http_host != "127.0.0.1" || http_port_num !~ /^[0-9][0-9]*$/ || http_port_num < 1 || http_port_num > 65535 || http_port_num == 3001 || http_port_num == 5353) {
+        $0 = "  address: 127.0.0.1:3000"
+      }
+    }
     section == "dns" && /^  port:/ { $0 = "  port: 5353" }
     $0 == "  - '\''||z23r562938.iask.in^$importa'\''" { $0 = "  - '\''||z23r562938.iask.in^$important'\''" }
     $0 == "  - '\''||sentry.io^$importantnt'\''" { $0 = "  - '\''||sentry.io^$important'\''" }
@@ -1097,8 +1777,7 @@ migrate_config() {
     rm -f "$temp"
     changed=1
   else
-    [ -e "$CONFIG.before-port-migration" ] || cp "$CONFIG" "$CONFIG.before-port-migration"
-    [ -e "$CONFIG.before-rule-repair" ] || cp "$CONFIG" "$CONFIG.before-rule-repair"
+    [ -e "$CONFIG.bak" ] || cp "$CONFIG" "$CONFIG.bak"
     mv "$temp" "$CONFIG"
     chmod 600 "$CONFIG"
     log "configuration migration and built-in rule repair completed"
@@ -1109,29 +1788,124 @@ migrate_config() {
   return "$changed"
 }
 
+
+# ------------------------------------------------------------------------------
+# get_http_port - 从 AdGuardHome.yaml 读取实际监听的管理端口
+# 管理器 App 通过控制桥调用本命令，与实际运行端口对齐，避免使用本地缓存端口。
+# ------------------------------------------------------------------------------
+get_http_port() {
+  local port
+  [ -s "$CONFIG" ] || { echo config-missing; return 1; }
+  port=$(awk '
+    /^http:/ { section = "http"; next }
+    /^[a-zA-Z_]+:/ { section = "" }
+    section == "http" && /^  address:/ {
+      line = $0
+      sub(/^.*:/, "", line)
+      gsub(/[^0-9]/, "", line)
+      if (line ~ /^[0-9]+$/) print line
+      exit
+    }
+  ' "$CONFIG" 2>/dev/null)
+  case "$port" in ''|*[!0-9]*|[0]|[0][0-9]*) echo config-invalid; return 1 ;; esac
+  if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    echo config-invalid
+    return 1
+  fi
+  if [ "$port" = "3001" ] || [ "$port" = "5353" ]; then
+    echo port-conflict
+    return 1
+  fi
+  echo "$port"
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# set_http_port - 修改 AdGuard Home 管理 API 监听端口
+# 功能：把 YAML 中 http.address 改为 127.0.0.1:<port>，调用方随后负责重启服务。
+# ------------------------------------------------------------------------------
+set_http_port() {
+  local port=$1
+  local temp=$CONFIG.port-set
+  [ -s "$CONFIG" ] || return 2
+  awk -v port="$port" '
+    /^[^ ]/ {
+      if ($0 ~ /^http:/) section = "http"
+      else if ($0 ~ /^dns:/) section = "dns"
+      else section = ""
+    }
+    section == "http" && /^  address:/ { $0 = "  address: 127.0.0.1:" port }
+    { print }
+  ' "$CONFIG" > "$temp" || { rm -f "$temp"; return 2; }
+  if ! mv "$temp" "$CONFIG"; then
+    rm -f "$temp"
+    return 2
+  fi
+  chmod 600 "$CONFIG" 2>/dev/null || :
+  state_set http_port "$port"
+  log "http management port set to $port"
+  echo "http-port $port"
+  return 0
+}
+
+# ==============================================================================
+# 服务生命周期管理
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# start - 启动 AdGuard Home 服务
+# 功能：完整的服务启动流程
+#
+# 流程：
+#   1. 创建目录结构并设置权限
+#   2. 清除手动禁用标记
+#   3. 恢复可能残留的 DNS 接管
+#   4. 清理旧的 iptables 规则
+#   5. 构建 CA 证书包
+#   6. 初始化过滤器缓存
+#   7. 迁移和修复配置文件
+#   8. 如果服务已运行，执行热重载
+#   9. 如果服务未运行，启动新进程
+#   10. 安装 iptables 规则
+#   11. 执行 DNS 接管
+#   12. 启动代理兼容同步
+#   13. 启动系统策略清理器
+#
+# 返回：0 = 成功（输出 "running"），1 = 失败（输出 "failed"）
+# ------------------------------------------------------------------------------
 start() {
-  mkdir -p "$DATA_DIR/work" "$DATA_DIR/logs"
-  rm -f "$DISABLED_FILE"
+  mkdir -p "$DATA_DIR/work" "$DATA_DIR/work/data/filters" "$DATA_DIR/logs"
+  chmod 700 "$DATA_DIR" "$DATA_DIR/work" "$DATA_DIR/work/data" "$DATA_DIR/work/data/filters" 2>/dev/null
+  chmod 755 "$AGH_BIN" "$PROXY_CTL" "$APP_CLEANER" 2>/dev/null
+  if [ ! -x "$AGH_BIN" ]; then
+    log "AdGuardHome binary is missing or not executable: $AGH_BIN"
+    echo "failed: 模块核心文件缺失或不可执行（$AGH_BIN）"
+    return 1
+  fi
+  state_set disabled_boot_id ''
   # Restore a resolver takeover left by a crash before changing interception.
   # A failed restore is retained and retried after the local DNS process starts.
   resolver_restore || log "resolver restore is pending while service starts"
   remove_iptables_rules
   if ! build_ca_bundle; then
-    log "failed to build the Android system CA bundle"
-    echo failed
-    return 1
+    log "Android CA bundle unavailable; starting without SSL_CERT_FILE"
+    CA_BUNDLE=''
   fi
+  sync_rules_on_update
   seed_filter_cache
   local seeded=$?
   migrate_config
   local migrated=$?
   if is_running; then
     if [ "$seeded" -eq 0 ] || [ "$migrated" -eq 0 ] || ! has_current_launch_environment; then
-      kill "$(cat "$PID_FILE")" 2>/dev/null
-      sleep 1
-      is_running && kill -9 "$(cat "$PID_FILE")" 2>/dev/null
-      rm -f "$PID_FILE"
-      rm -f "$LAUNCH_FILE"
+      local runpid
+      runpid=$(state_get pid 2>/dev/null)
+      case "$runpid" in ''|*[!0-9]*|0) ;; *) kill "$runpid" 2>/dev/null ;; esac
+      portable_sleep 1
+      if is_running; then runpid=$(state_get pid 2>/dev/null); case "$runpid" in ''|*[!0-9]*|0) ;; *) kill -9 "$runpid" 2>/dev/null ;; esac; fi
+      state_set pid 0
+      state_set ssl_cert_file ''
+      state_set status stopped
     else
       if ! install_rules; then
         log "service is running, but DNS interception could not be installed"
@@ -1145,19 +1919,28 @@ start() {
       fi
       proxy_control sync >/dev/null 2>&1 || log "proxy compatibility sync failed"
       start_app_cleaner
+      state_set status running
       echo running
       return 0
     fi
   fi
-  rm -f "$PID_FILE"
-  SSL_CERT_FILE="$CA_BUNDLE" "$AGH_BIN" -c "$CONFIG" -w "$DATA_DIR/work" >> "$LOG_FILE" 2>&1 &
+  state_set pid 0
+  if [ -n "$CA_BUNDLE" ] && [ -s "$CA_BUNDLE" ]; then
+    SSL_CERT_FILE="$CA_BUNDLE" "$AGH_BIN" -c "$CONFIG" -w "$DATA_DIR/work" >> "$LOG_FILE" 2>&1 &
+  else
+    "$AGH_BIN" -c "$CONFIG" -w "$DATA_DIR/work" >> "$LOG_FILE" 2>&1 &
+  fi
   local pid=$!
-  echo "$pid" > "$PID_FILE"
-  {
-    echo "pid=$pid"
-    echo "ssl_cert_file=$CA_BUNDLE"
-  } > "$LAUNCH_FILE"
-  sleep 1
+  state_set pid "$pid"
+  state_set ssl_cert_file "$CA_BUNDLE"
+  state_set status running
+  # 启动较慢的机器最多等 10 秒,避免 1 秒判定失败但进程随后才就绪。
+  local waited=0
+  while [ "$waited" -lt 20 ]; do
+    is_running && break
+    portable_sleep 0.5
+    waited=$((waited + 1))
+  done
   if is_running; then
     if ! install_rules; then
       log "service started without DNS interception"
@@ -1166,7 +1949,9 @@ start() {
     if resolver_sync; then
       reset_browser_network_state
     else
-      log "DNSResolver takeover is unavailable; keeping fail-open"
+      # DNSResolver failed but iptables rules are still active
+      # DNS traffic will be intercepted via iptables redirect to port 5353
+      log "DNSResolver takeover unavailable; using iptables fallback mode"
     fi
     proxy_control sync >/dev/null 2>&1 || log "proxy compatibility sync failed"
     start_app_cleaner
@@ -1176,16 +1961,41 @@ start() {
   fi
   resolver_restore
   remove_iptables_rules
-  rm -f "$PID_FILE"
-  rm -f "$LAUNCH_FILE"
+  state_set pid 0
+  state_set ssl_cert_file ''
+  state_set status stopped
   log "service failed to start"
-  echo failed
+  local reason
+  reason=$(tail -n 30 "$LOG_FILE" 2>/dev/null | grep -aiE "address already in use|permission denied|no such file|not executable|exec format|error|failed|fatal" | tail -n 1 | cut -c1-200)
+  if [ -n "$reason" ]; then
+    echo "failed: $reason"
+  else
+    echo "failed: 进程未能启动，请查看 $LOG_FILE"
+  fi
   return 1
 }
 
+# ------------------------------------------------------------------------------
+# stop - 停止 AdGuard Home 服务
+# 功能：完整的服务停止流程
+#
+# 流程：
+#   1. 创建手动禁用标记（重启后自动清除）
+#   2. 暂停代理兼容并恢复配置
+#   3. 停止系统策略清理器
+#   4. 恢复系统 DNS 设置（关键步骤，必须在停止 AdGuard Home 之前）
+#   5. 移除 iptables 规则
+#   6. 清除 iptables 回退模式标记
+#   7. 终止 AdGuard Home 进程
+#   8. 验证 DNS 是否恢复成功
+#   9. 如果 DNS 恢复失败，尝试刷新 Wi-Fi
+#
+# 安全设计：
+#   - 如果 DNS 无法恢复，拒绝停止服务（避免断网）
+#   - 在停止 AdGuard Home 之前先恢复 DNS，确保有可用的 DNS
+# ------------------------------------------------------------------------------
 stop() {
-  current_boot_id > "$DISABLED_FILE" 2>/dev/null || : > "$DISABLED_FILE"
-  chmod 600 "$DISABLED_FILE" 2>/dev/null
+  state_set disabled_boot_id "$(current_boot_id 2>/dev/null)"
   # Proxy configurations may use AdGuard Home as their only DNS upstream.
   # Restore them before stopping the local resolver.
   proxy_control suspend >/dev/null 2>&1 || log "proxy compatibility suspend failed"
@@ -1194,28 +2004,32 @@ stop() {
   # accepted its original servers.  A missing companion helper therefore
   # leaves AdGuard Home running instead of disconnecting the whole device.
   if ! resolver_restore; then
-    rm -f "$DISABLED_FILE"
+    state_set disabled_boot_id ''
     log "refused to stop while system DNS could not be restored"
     echo restore-failed
     return 1
   fi
   remove_iptables_rules
+  iptables_fallback_clear
   if is_running; then
-    kill "$(cat "$PID_FILE")" 2>/dev/null
-    sleep 1
-    is_running && kill -9 "$(cat "$PID_FILE")" 2>/dev/null
+    local runpid
+    runpid=$(state_get pid 2>/dev/null)
+    case "$runpid" in ''|*[!0-9]*|0) ;; *) kill "$runpid" 2>/dev/null ;; esac
+    portable_sleep 1
+    if is_running; then runpid=$(state_get pid 2>/dev/null); case "$runpid" in ''|*[!0-9]*|0) ;; *) kill -9 "$runpid" 2>/dev/null ;; esac; fi
   fi
-  rm -f "$PID_FILE"
-  rm -f "$LAUNCH_FILE"
+  state_set pid 0
+  state_set ssl_cert_file ''
+  state_set status stopped
   if ! verify_restored_dns; then
     # Refresh only Wi-Fi.  Toggling it while cellular/VPN is the active
     # transport would be a destructive network change unrelated to recovery.
     if network_is_wifi; then
       log "restored resolver remained stale on Wi-Fi; cycling Wi-Fi to recover DNS"
       svc wifi disable >/dev/null 2>&1 || :
-      sleep 1
+      portable_sleep 1
       svc wifi enable >/dev/null 2>&1 || :
-      sleep 3
+      portable_sleep 3
       verify_restored_dns || log "DNS remained unavailable after Wi-Fi refresh"
     else
       log "restored resolver probe failed; leaving non-Wi-Fi transport untouched"
@@ -1223,6 +2037,29 @@ stop() {
   fi
   log "service stopped"
   echo stopped
+}
+
+restart_service() {
+  # 用户主动重启:不跑 stop() 的断网校验/网络切换,避免恢复流程耗时或失败
+  # 导致控制桥 RPC 超时、重启卡死;直接停掉核心再拉起。
+  state_set disabled_boot_id ''
+  proxy_control suspend >/dev/null 2>&1 || log "proxy compatibility suspend failed"
+  stop_app_cleaner
+  # 尽力恢复原 DNS;即使失败也继续,因为 start 会立即重新接管。
+  resolver_restore || log "resolver restore failed during restart; continuing because service will start again"
+  remove_iptables_rules
+  iptables_fallback_clear
+  if is_running; then
+    local runpid
+    runpid=$(state_get pid 2>/dev/null)
+    case "$runpid" in ''|*[!0-9]*|0) ;; *) kill "$runpid" 2>/dev/null ;; esac
+    portable_sleep 1
+    if is_running; then runpid=$(state_get pid 2>/dev/null); case "$runpid" in ''|*[!0-9]*|0) ;; *) kill -9 "$runpid" 2>/dev/null ;; esac; fi
+  fi
+  state_set pid 0
+  state_set ssl_cert_file ''
+  state_set status stopped
+  start
 }
 
 migrate() {
@@ -1292,25 +2129,36 @@ export_logs() {
 }
 
 case "$1" in
-  start|stop|restart|rules|cleanup|recover|migrate|filter-seed|factory-rules|network-failsafe|network-alert-ack|proxy-enable|proxy-disable|proxy-sync|proxy-path-add|proxy-path-delete|proxy-subscription-set|proxy-subscription-apply|proxy-subscription-delete|logs-clean|logs-export)
+  start|stop|restart|rules|cleanup|recover|migrate|filter-seed|factory-rules|network-failsafe|network-alert-ack|proxy-enable|proxy-disable|proxy-sync|proxy-path-add|proxy-path-delete|proxy-subscription-set|proxy-subscription-apply|proxy-subscription-delete|logs-clean|logs-export|port-set)
     mkdir -p "$DATA_DIR/logs" 2>/dev/null
-    echo "$(date '+%Y-%m-%d %H:%M:%S') control action: $1" >> "$DATA_DIR/logs/control.log"
+    echo "$(portable_date '+%Y-%m-%d %H:%M:%S') control action: $1" >> "$DATA_DIR/logs/control.log"
     ;;
 esac
 
 case "$1" in
-  start|stop|restart|rules|cleanup|recover|migrate|sync|resolver-sync|filter-seed|network-failsafe|network-alert-ack|proxy-enable|proxy-disable|proxy-sync|proxy-path-add|proxy-path-delete|proxy-subscription-set|proxy-subscription-apply|proxy-subscription-delete|logs-clean|logs-export)
+  start|stop|restart|rules|cleanup|recover|migrate|sync|resolver-sync|filter-seed|network-failsafe|network-alert-ack|proxy-enable|proxy-disable|proxy-sync|proxy-path-add|proxy-path-delete|proxy-subscription-set|proxy-subscription-apply|proxy-subscription-delete|logs-clean|logs-export|port-set)
     acquire_control_lock "$1" || { echo busy; exit 75; } ;;
 esac
 
 case "$1" in
   start) start ;;
   stop) stop ;;
-  restart) stop && start ;;
-  status) is_running && echo running || echo stopped ;;
+  restart) restart_service ;;
+  status)
+    if is_running; then
+      if iptables_fallback_active; then
+        echo "running (iptables fallback)"
+      else
+        echo "running"
+      fi
+    else
+      echo "stopped"
+    fi
+    ;;
   rules) rules ;;
   filter-seed) seed_filter_cache; result=$?; [ "$result" -eq 0 ] || [ "$result" -eq 1 ]; echo filter-cache-ready ;;
   factory-rules) factory_rules ;;
+  rules-sync) copy_template_rules ;;
   network-failsafe) network_failsafe ;;
   network-alert) network_alert ;;
   network-alert-ack) network_alert_ack ;;
@@ -1318,7 +2166,7 @@ case "$1" in
   # cleanup is the supervisor's pre-start transaction.  Restoring proxy
   # configuration here causes a restore/re-apply restart loop.  Explicit
   # stop, recover, proxy-disable and uninstall still restore it.
-  cleanup) stop_app_cleaner; resolver_restore; result=$?; remove_iptables_rules; echo rules-removed; exit "$result" ;;
+  cleanup) stop_app_cleaner; resolver_restore; result=$?; remove_iptables_rules; iptables_fallback_clear; echo rules-removed; exit "$result" ;;
   recover) stop ;;
   resolver-sync) resolver_sync ;;
   sync) sync_all ;;
@@ -1335,7 +2183,38 @@ case "$1" in
   proxy-subscription-delete) proxy_control subscription-delete ;;
   logs-clean) clean_logs ;;
   logs-export) export_logs ;;
+  port-set)
+    case "$2" in
+      ''|*[!0-9]*) echo invalid-port; exit 64 ;;
+    esac
+    if [ "$2" -lt 1 ] || [ "$2" -gt 65535 ]; then
+      echo invalid-port
+      exit 64
+    fi
+    if [ "$2" = "3001" ] || [ "$2" = "5353" ]; then
+      echo port-conflict
+      exit 64
+    fi
+    set_http_port "$2" || { echo port-update-failed; exit 1; }
+    stop && start
+    ;;
+  port-get) get_http_port ;;
   network-info) network_info ;;
+  iptables-status)
+    echo "=== iptables NAT rules ==="
+    "$IPTABLES" -t nat -L AGH_DNS -n 2>/dev/null || echo "AGH_DNS chain not found"
+    echo ""
+    echo "=== ip6tables NAT rules ==="
+    "$IP6TABLES" -t nat -L AGH_DNS6 -n 2>/dev/null || echo "AGH_DNS6 chain not found"
+    echo ""
+    echo "=== Fallback mode ==="
+    if iptables_fallback_active; then
+      echo "netid=$(state_get iptables_fallback_netid)"
+      echo "started=$(state_get iptables_fallback_started)"
+    else
+      echo "not in fallback mode"
+    fi
+    ;;
   migrate) migrate ;;
-  *) echo "Usage: $0 {start|stop|restart|status|rules|cleanup|network-info|migrate|filter-seed|factory-rules|network-failsafe|network-alert|network-alert-ack|proxy-enable|proxy-disable|proxy-status|proxy-sync|proxy-paths|proxy-path-add|proxy-path-delete|proxy-subscription|proxy-subscription-set|proxy-subscription-apply|proxy-subscription-delete|logs-clean|logs-export}"; exit 64 ;;
+  *) echo "Usage: $0 {start|stop|restart|status|rules|cleanup|network-info|migrate|filter-seed|factory-rules|network-failsafe|network-alert|network-alert-ack|proxy-enable|proxy-disable|proxy-status|proxy-sync|proxy-paths|proxy-path-add|proxy-path-delete|proxy-subscription|proxy-subscription-set|proxy-subscription-apply|proxy-subscription-delete|logs-clean|logs-export|port-set|port-get|rules-sync}"; exit 64 ;;
 esac

@@ -55,8 +55,6 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.util.lerp
-import com.adguardhome.android.ui.liquid.lens
-import com.adguardhome.android.ui.liquid.vibrancy
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -95,7 +93,6 @@ fun JellyFloatingBottomBar(
     tabsCount: Int,
     backdrop: Backdrop,
     blurEnabled: Boolean,
-    liquidGlassEnabled: Boolean,
     modifier: Modifier = Modifier,
     content: @Composable RowScope.(index: Int, selected: Boolean) -> Unit,
 ) {
@@ -111,7 +108,6 @@ fun JellyFloatingBottomBar(
     var tabWidthPx by remember { mutableFloatStateOf(0f) }
     var totalWidthPx by remember { mutableFloatStateOf(0f) }
     var dragging by remember { mutableStateOf(false) }
-    val glass = liquidGlassEnabled && isRenderEffectSupported()
     val blur = blurEnabled && isRenderEffectSupported()
     val shape = CircleShape
     val baseColor = MaterialTheme.colorScheme.surface
@@ -202,24 +198,13 @@ fun JellyFloatingBottomBar(
                 .graphicsLayer { translationX = panelShift }
                 .then(
                     when {
-                        glass -> Modifier.drawBackdrop(
-                            backdrop = backdrop,
-                            shape = { shape },
-                            effects = {
-                                vibrancy()
-                                if (blur) blur(4.dp.toPx(), 4.dp.toPx())
-                                lens(24.dp.toPx(), 24.dp.toPx())
-                            },
-                            onDrawSurface = { drawRect(baseColor.copy(alpha = 0.82f)) },
-                        )
                         blur -> Modifier.drawBackdrop(
                             backdrop = backdrop,
                             shape = { shape },
                             effects = {
-                                vibrancy()
-                                blur(4.dp.toPx(), 4.dp.toPx())
+                                if (blur) blur(6.dp.toPx(), 6.dp.toPx())
                             },
-                            onDrawSurface = { drawRect(baseColor.copy(alpha = 0.88f)) },
+                            onDrawSurface = { drawRect(baseColor.copy(alpha = 0.6f)) },
                         )
                         else -> Modifier.background(baseColor, shape)
                     }
@@ -249,26 +234,7 @@ fun JellyFloatingBottomBar(
                         scaleY = pressedScale * (1f - velocity * 0.25f)
                         clip = false
                     }
-                    .then(
-                        if (glass) Modifier.drawBackdrop(
-                            backdrop = backdrop,
-                            shape = { shape },
-                            effects = {
-                                vibrancy()
-                                if (blur) blur(4.dp.toPx(), 4.dp.toPx())
-                                lens(
-                                    refractionHeight = 10.dp.toPx() * press.value,
-                                    refractionAmount = 14.dp.toPx() * press.value,
-                                    depthEffect = true,
-                                    chromaticAberration = 0.5f * press.value,
-                                )
-                            },
-                            onDrawSurface = {
-                                drawRect(dropletColor.copy(alpha = dropletColor.alpha * (1f - press.value)))
-                                drawRect(Color.Black.copy(alpha = 0.03f * press.value))
-                            },
-                        ) else Modifier.background(dropletColor, shape)
-                    )
+                    .background(dropletColor, shape)
                     .width(with(density) { tabWidthPx.toDp() })
                     .height(56.dp)
             )
