@@ -1590,18 +1590,46 @@ setup_ipv6_fallback() {
 }
 
 sync_ipv6_dns_fallback() {
+  local bypass6
+  bypass6=$(dns_bypass_addrs | grep ':')
   if table_available "$IP6TABLES" nat; then
     remove_ipv6_fallback "$IP6TABLES"
     return 0
   fi
   if network_has_dual_stack_dns; then
     ipv6_fallback_installed "$IP6TABLES" && return 0
-    setup_ipv6_fallback "$IP6TABLES" ::1/128 2400:7fc0:849e:200::4 2404:c2c0:85d8:901::4
+    setup_ipv6_fallback "$IP6TABLES" ::1/128 2400:7fc0:849e:200::4 2404:c2c0:85d8:901::4 $bypass6
   else
     # IPv6-only networks must remain usable even when Resolver takeover is
     # unsupported.  The fallback is safe only when IPv4 DNS can be redirected.
     remove_ipv6_fallback "$IP6TABLES"
   fi
+}
+
+# ------------------------------------------------------------------------------
+# dns_bypass_addrs - 从运行配置的 dns 段解析上游/bootstrap 的 IP 字面量。
+# 这些地址必须放行,否则用户把上游改成普通 DNS IP(如 223.5.5.5)后,
+# AGH 自己的上游查询会被 iptables 重定向回自己,形成死循环并疯狂累加查询数。
+# ------------------------------------------------------------------------------
+dns_bypass_addrs() {
+  [ -s "$CONFIG" ] || return 0
+  awk '
+    /^[a-zA-Z_]+:/ { section = ($0 ~ /^dns:/) ? "dns" : "" }
+    section == "dns" {
+      line = $0
+      gsub(/[^0-9a-fA-F:.]+/, " ", line)
+      n = split(line, a, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) {
+        tok = a[i]
+        if (tok ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/) sub(/:[0-9]+$/, "", tok)
+        if (tok ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+          if (tok != "127.0.0.1" && tok != "127.0.0.0" && tok != "0.0.0.0" && !seen[tok]++) print tok
+        } else if (tok ~ /^[0-9a-fA-F:]+:[0-9a-fA-F:]+$/) {
+          if (tok != "::1" && tok != "::" && !seen[tok]++) print tok
+        }
+      }
+    }
+  ' "$CONFIG" 2>/dev/null
 }
 
 # ------------------------------------------------------------------------------
@@ -1618,15 +1646,19 @@ install_rules() {
   # Always begin from a known fail-open state.  In particular, never leave a
   # partial jump behind when one of the device's iptables backends rejects it.
   remove_iptables_rules
+  # 上游/bootstrap IP 必须放行,否则 AGH 的上游查询会被重定向回自己形成循环。
+  local bypass4 bypass6
+  bypass4=$(dns_bypass_addrs | grep -v ':')
+  bypass6=$(dns_bypass_addrs | grep ':')
   # IDnsResolver sends takeover traffic to 127.0.0.1:53.  Do not exempt the
   # loopback destination: AdGuard Home listens on 5353 and needs this redirect.
-  setup_chain "$IPTABLES" AGH_DNS 180.184.1.1 180.184.2.2 || {
+  setup_chain "$IPTABLES" AGH_DNS 180.184.1.1 180.184.2.2 $bypass4 || {
     remove_iptables_rules
     return 1
   }
   if table_available "$IP6TABLES" nat; then
     remove_ipv6_fallback "$IP6TABLES"
-    setup_chain "$IP6TABLES" AGH_DNS6 2400:7fc0:849e:200::4 2404:c2c0:85d8:901::4 || {
+    setup_chain "$IP6TABLES" AGH_DNS6 2400:7fc0:849e:200::4 2404:c2c0:85d8:901::4 $bypass6 || {
       remove_iptables_rules
       return 1
     }
@@ -1773,6 +1805,12 @@ migrate_config() {
     awk '{ print; if ($0 == "    - 127.0.0.1") print "    - ::1" }' "$temp" > "$temp.ipv6" || return 2
     mv "$temp.ipv6" "$temp"
   fi
+  # 补充更通用的 bootstrap,并在 install_rules 里随配置动态放行,避免上游死循环。
+  for bootstrap in 223.5.5.5 119.29.29.29; do
+    grep -Fqx "    - $bootstrap" "$temp" && continue
+    awk -v ip="$bootstrap" '{ print; if ($0 == "  bootstrap_dns:") print "    - " ip }' "$temp" > "$temp.bootstrap" || return 2
+    mv "$temp.bootstrap" "$temp"
+  done
   if cmp -s "$CONFIG" "$temp"; then
     rm -f "$temp"
     changed=1

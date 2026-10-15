@@ -1,6 +1,6 @@
 id=adguardhome
 name=AdGuard Home for Android
-version=1.2.7
-versionCode=1207000
+version=1.2.8-beta2
+versionCode=1208002
 author=Ceromis（主导开发）/ Ling（共创）
 description=适用于 Magisk/KernelSU 的 AdGuard Home 本地 DNS 去广告模块，内置 ARM64 核心与原生控制应用，默认管理端口 3000，WebUI 默认账号密码 root。

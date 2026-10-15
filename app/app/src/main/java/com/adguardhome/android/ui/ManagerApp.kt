@@ -83,7 +83,7 @@ import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.window.WindowDialog
 
-private data class QueryEntry(val domain: String, val type: String, val client: String, val blocked: Boolean, val reason: String = "", val rule: String = "")
+private data class QueryEntry(val domain: String, val type: String, val client: String, val blocked: Boolean, val status: String, val reason: String = "", val rule: String = "")
 private data class FilterEntry(val name: String, val url: String, val rules: Int, val enabled: Boolean)
 private data class EditableRule(val id: Long, val value: String)
 private object RulePreloadCache { var values: List<String>? = null }
@@ -821,25 +821,40 @@ private fun QueryLogPage() {
     var ruleDialog by remember { mutableStateOf<QueryEntry?>(null) }
     fun reload() = scope.launch {
         suspend fun fetch(): Result<List<QueryEntry>> = withContext(Dispatchers.IO) { runCatching {
-            // 使用 AdGuard Home API 获取所有查询日志（包括拦截和放行的）
-            // response_status=all 或不传此参数获取所有状态
+            // 状态判定以 reason 为主、核心自己的分类筛选为辅:
+            // 部分版本或迁移后的数据里 reason 可能为空或为历史枚举数字,只靠它会把
+            // 拦截条目误判成"已处理"。这里的四个分类值和核心 WebUI 使用同一套筛选
+            // 依据(response_status=blocked/rewritten/whitelisted/filtered),天然一致。
+            suspend fun categoryKeys(status: String): Set<String> = runCatching {
+                val data = api.get("/control/querylog?limit=100&response_status=$status").optJSONArray("data") ?: JSONArray()
+                buildSet { for (i in 0 until data.length()) data.optJSONObject(i)?.let { add(queryEntryKey(it)) } }
+            }.getOrDefault(emptySet())
+            val blockedKeys = categoryKeys("blocked")
+            val rewrittenKeys = categoryKeys("rewritten")
+            val whitelistKeys = categoryKeys("whitelisted")
+            val filteredKeys = categoryKeys("filtered")
             val rows = api.get("/control/querylog?limit=100&response_status=all").optJSONArray("data") ?: JSONArray()
             List(rows.length()) { i -> rows.optJSONObject(i) }.mapNotNull { row -> row?.let {
                 val q = it.optJSONObject("question")
-                val reason = it.optString("reason", "")
-                // 修复 bug:AGH 0.107 querylog 不再返回单独的 "blocked" 字段,
-                // 拦截状态只能从 reason 推断。AdGuard 的 Reason 枚举:
-                //   NotFiltered / NotFilteredNotFound / NotFilteredWhiteList → 未拦截
-                //   FilteredBlackList / FilteredBlockList / FilteredBlockingService → 已拦截
-                //   Rewrite / RewriteRule / BlockedByCNAME / BlockedByHosts         → 已拦截
-                // 用 !startsWith("NotFiltered") 比 contains("Filtered") 准确,
-                // 因为后者对 NotFiltered* 也会匹配("NotFilteredNotFound".contains("Filtered"))。
-                val isBlocked = reason.isNotEmpty() && !reason.startsWith("NotFiltered")
+                val key = queryEntryKey(it)
+                val reason = normalizeQueryReason(it.optString("reason", ""))
+                val known = queryReasonLabel(reason)
+                val byCategory = when {
+                    key in blockedKeys -> "已拦截"
+                    key in rewrittenKeys -> "重写项"
+                    key in whitelistKeys -> "允许项"
+                    key in filteredKeys -> "已拦截"
+                    else -> null
+                }
+                val status = known ?: byCategory ?: reason.ifEmpty { "已处理" }
+                val blocked = (known != null && known != "重写项" && known != "允许项" && known != "已处理") ||
+                    (known == null && (key in filteredKeys || reason.startsWith("Filtered")))
                 QueryEntry(
                     domain = q?.optString("name", "未知域名") ?: "未知域名",
                     type = q?.optString("type", "") ?: "",
                     client = it.optString("client", "本机"),
-                    blocked = isBlocked,
+                    blocked = blocked,
+                    status = status,
                     reason = reason,
                     rule = it.optString("rule", "")
                 )
@@ -866,9 +881,9 @@ private fun QueryLogPage() {
             // AGH 端 user_rules 本身已对重复项去重,所以重复添加拦截规则不会出错;
             // 而 allowlist 操作交由过滤规则页 / user_rules 手动管理更安全,
             // 也避免之前 status 误判时"显示全拦截 + 实际生成放行规则"的 bug。
-            val statusText = if (row.blocked) "已拦截" else "已放行"
-            val reasonText = if (row.reason.isNotEmpty()) "  ${row.reason}" else ""
-            ManagerCard(row.domain, "$statusText$reasonText  ${row.type}  ${row.client}") {
+            // 逐条状态文案在抓取时已按核心语义判定,与核心查询日志(web UI)一致。
+            val statusText = row.status
+            ManagerCard(row.domain, "$statusText  ${row.type}  ${row.client}") {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                     OutlinedButton(
                         enabled = !row.blocked,
@@ -876,7 +891,7 @@ private fun QueryLogPage() {
                     ) {
                         Icon(Icons.Rounded.Block, null, tint = MaterialTheme.colorScheme.error)
                         Spacer(Modifier.width(6.dp))
-                        Text(if (row.blocked) "已拦截" else "拦截")
+                        Text(if (row.blocked) statusText else "拦截")
                     }
                 }
             }
@@ -991,6 +1006,8 @@ private fun SettingsPage(openProxy: () -> Unit, openTheme: () -> Unit, openDns: 
     val context = LocalContext.current; val theme = LocalThemeSettings.current; val api = remember { ApiClient.getInstance() }; val control = remember { ModuleControlClient() }
     val scope = rememberCoroutineScope(); var message by remember { mutableStateOf<String?>(null) }; var taskFailed by remember { mutableStateOf(false) }; var busy by remember { mutableStateOf(false) }
     var confirmAction by remember { mutableStateOf<ConfirmKind?>(null) }
+    var resetStatsConfirm by remember { mutableStateOf(false) }
+    var resetCountdown by remember { mutableIntStateOf(20) }
     var portDialog by remember { mutableStateOf(false) }
     var portValue by remember { mutableStateOf(TextFieldValue("")) }
     var portError by remember { mutableStateOf<String?>(null) }
@@ -998,6 +1015,16 @@ private fun SettingsPage(openProxy: () -> Unit, openTheme: () -> Unit, openDns: 
         portValue = TextFieldValue(api.getPort().toString())
         portError = null
         portDialog = true
+    }
+    // 重置统计的二级确认：20 秒倒计时结束后才允许点击清除。
+    LaunchedEffect(resetStatsConfirm) {
+        if (resetStatsConfirm) {
+            resetCountdown = 20
+            while (resetCountdown > 0) {
+                delay(1000)
+                resetCountdown--
+            }
+        }
     }
     LaunchedEffect(Unit) {
         if (RulePreloadCache.values == null) withContext(Dispatchers.IO) {
@@ -1022,6 +1049,7 @@ private fun SettingsPage(openProxy: () -> Unit, openTheme: () -> Unit, openDns: 
         busy = false
         if (result.isSuccess) syncApiPortFromBridge()
     }
+    fun resetStats() = task("正在重置统计…", "统计已重置") { api.post("/control/stats_reset", JSONObject()) }
     if (theme.value.style == UiStyle.MIUIX) {
         MiuixSettingsContent(
             openProxy = openProxy,
@@ -1039,6 +1067,7 @@ private fun SettingsPage(openProxy: () -> Unit, openTheme: () -> Unit, openDns: 
             openPort = { openPortDialog() },
             requestUpdateFilters = { if (!busy) confirmAction = ConfirmKind.UPDATE_FILTERS },
             requestClearCache = { if (!busy) confirmAction = ConfirmKind.CLEAR_CACHE },
+            requestResetStats = { if (!busy) resetStatsConfirm = true },
             requestRestart = { if (!busy) confirmAction = ConfirmKind.RESTART },
             requestClearLogs = { if (!busy) confirmAction = ConfirmKind.CLEAR_LOGS },
             requestRecover = { if (!busy) confirmAction = ConfirmKind.RECOVER },
@@ -1057,10 +1086,13 @@ private fun SettingsPage(openProxy: () -> Unit, openTheme: () -> Unit, openDns: 
         item { ManagerCard("管理端口", "当前 ${api.getPort()}。修改后自动重启 AdGuard Home 生效。") {
             TextButton(onClick = { openPortDialog() }, enabled = !busy) { Text("修改端口"); Icon(Icons.Rounded.ChevronRight, null) }
         } }
-        item { ManagerCard("过滤与缓存", "更新过滤器或清除 AdGuard Home DNS 缓存。") {
+        item { ManagerCard("过滤与缓存", "更新过滤器、清除缓存或重置统计数据。") {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = { confirmAction = ConfirmKind.UPDATE_FILTERS }, enabled = !busy) { Text("更新过滤器") }
                 OutlinedButton(onClick = { confirmAction = ConfirmKind.CLEAR_CACHE }, enabled = !busy) { Text("清除缓存") }
+            }
+            OutlinedButton(onClick = { if (!busy) resetStatsConfirm = true }, enabled = !busy) {
+                Icon(Icons.Rounded.QueryStats, null); Spacer(Modifier.width(6.dp)); Text("重置统计")
             }
         } }
         item { ManagerCard("模块日志", "日志集中保存在 /data/adb/agh/logs，并会自动限长。") {
@@ -1095,6 +1127,18 @@ private fun SettingsPage(openProxy: () -> Unit, openTheme: () -> Unit, openDns: 
                 ConfirmKind.RESTART -> task("正在重启模块…", "模块重启完成") { val result = control.execute("restart"); check(result.code == 0) { result.output } }
                 ConfirmKind.RECOVER -> task("正在恢复系统网络…", "系统网络已恢复") { val result = control.execute("recover"); check(result.code == 0) { result.output } }
             }
+        }
+    }
+    if (resetStatsConfirm) {
+        ConfirmDialog(
+            "重置统计",
+            "将清零查询与拦截计数，不影响过滤规则。确认按钮将在 20 秒倒计时结束后可用。",
+            if (resetCountdown > 0) "清除 (${resetCountdown}s)" else "清除",
+            { resetStatsConfirm = false },
+            confirmEnabled = resetCountdown <= 0,
+        ) {
+            resetStatsConfirm = false
+            resetStats()
         }
     }
     fun applyPort() {
@@ -1201,6 +1245,7 @@ private fun MiuixSettingsContent(
     openPort: () -> Unit,
     requestUpdateFilters: () -> Unit,
     requestClearCache: () -> Unit,
+    requestResetStats: () -> Unit,
     requestRestart: () -> Unit,
     requestClearLogs: () -> Unit,
     requestRecover: () -> Unit,
@@ -1262,6 +1307,10 @@ private fun MiuixSettingsContent(
                 ArrowPreference(
                     title = "清除 DNS 缓存", summary = "清空 AdGuard Home 查询缓存",
                     startAction = { MiuixIcon(Icons.Rounded.DeleteSweep, null, Modifier.padding(end = 6.dp)) }, onClick = requestClearCache,
+                )
+                ArrowPreference(
+                    title = "重置统计", summary = "清零查询与拦截计数",
+                    startAction = { MiuixIcon(Icons.Rounded.QueryStats, null, Modifier.padding(end = 6.dp)) }, onClick = requestResetStats,
                 )
             }
         }
@@ -1368,7 +1417,17 @@ private fun DnsPage() {
     PageList {
         item { PageTitle("Android 系统 DNS", "配置 AdGuard Home 上游或恢复系统解析器") }
         item { ManagerCard("上游 DNS") { OutlinedTextField(upstream, { upstream = it }, Modifier.fillMaxWidth(), minLines = 3, label = { Text("每行一个上游地址") }); Button(onClick = {
-            scope.launch { val values = upstream.lines().map(String::trim).filter(String::isNotBlank); val result = withContext(Dispatchers.IO) { runCatching { api.post("/control/dns_config", JSONObject().put("upstream_dns", JSONArray(values))) } }; message = result.fold({ "上游 DNS 已保存" }, ::friendlyError) }
+            scope.launch {
+                val values = upstream.lines().map(String::trim).filter(String::isNotBlank)
+                val saved = withContext(Dispatchers.IO) { runCatching { api.post("/control/dns_config", JSONObject().put("upstream_dns", JSONArray(values))) } }
+                if (saved.isSuccess) {
+                    // 立即同步 iptables 放行列表,避免上游改成 IP 后被重定向成环。
+                    withContext(Dispatchers.IO) { runCatching { control.execute("rules") } }
+                    message = "上游 DNS 已保存，拦截规则已同步"
+                } else {
+                    message = friendlyError(saved.exceptionOrNull()!!)
+                }
+            }
         }) { Text("保存") } } }
         item { ManagerCard("恢复系统 DNS", "停止模块、撤销 DNS 接管，并验证域名解析恢复。") { OutlinedButton(onClick = { confirmRecover = true }) { Text("停止并恢复") } } }
         message?.let { item { Text(it, color = MaterialTheme.colorScheme.primary) } }
@@ -1786,7 +1845,7 @@ private fun ProxySubscriptions() {
             links.addAll(it.lines().map(String::trim).filter(::validUrl))
         }.onFailure { error = friendlyError(it) }
         val compat = withContext(Dispatchers.IO) { runCatching { requireControlSuccess(control.execute("proxy-status")) } }
-        compat.onSuccess { status = it.output.trim().ifBlank { "代理兼容状态未知" } }
+        compat.onSuccess { status = proxyCompatStatusText(it.output) }
             .onFailure { status = "代理兼容状态暂不可用，仍可添加订阅" }
     }
     PageList {
@@ -1878,7 +1937,7 @@ private fun formatPauseRemaining(duration: Long): String {
     shape = RoundedCornerShape(6.dp),
 ) { Text(text, Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), color = if (failed) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSurface) }
 @Composable
-private fun ConfirmDialog(title: String, text: String, confirm: String, dismiss: () -> Unit, action: () -> Unit) {
+private fun ConfirmDialog(title: String, text: String, confirm: String, dismiss: () -> Unit, confirmEnabled: Boolean = true, action: () -> Unit) {
     if (LocalThemeSettings.current.value.style == UiStyle.MIUIX) {
         WindowDialog(
             show = true,
@@ -1891,11 +1950,11 @@ private fun ConfirmDialog(title: String, text: String, confirm: String, dismiss:
                 horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
             ) {
                 MiuixTextButton("取消", onClick = dismiss)
-                MiuixTextButton(confirm, onClick = action, colors = MiuixButtonDefaults.textButtonColorsPrimary())
+                MiuixTextButton(confirm, onClick = action, enabled = confirmEnabled, colors = MiuixButtonDefaults.textButtonColorsPrimary())
             }
         }
     } else {
-        AlertDialog(onDismissRequest = dismiss, title = { Text(title) }, text = { Text(text) }, confirmButton = { TextButton(onClick = action) { Text(confirm) } }, dismissButton = { TextButton(onClick = dismiss) { Text("取消") } })
+        AlertDialog(onDismissRequest = dismiss, title = { Text(title) }, text = { Text(text) }, confirmButton = { TextButton(onClick = action, enabled = confirmEnabled) { Text(confirm) } }, dismissButton = { TextButton(onClick = dismiss) { Text("取消") } })
     }
 }
 private fun validUrl(value: String) = value.trim().let { it.startsWith("http://") || it.startsWith("https://") }
@@ -1908,6 +1967,74 @@ private fun moduleResultMessage(actionName: String, result: ModuleControlClient.
         output.startsWith("failed:") -> "${actionName}失败：${output.removePrefix("failed:").trim()}"
         output == "restore-failed" -> "恢复系统 DNS 失败，已保持模块运行以避免断网"
         else -> "${actionName}失败：$output"
+    }
+}
+
+// 归一化核心返回的 reason:0.107.x 返回名称字符串(如 FilteredBlackList);
+// 部分历史数据或迁移后的记录可能是枚举数字(0-11),这里统一还原成名称。
+private fun normalizeQueryReason(raw: String): String {
+    val value = raw.trim()
+    if (value.isEmpty()) return ""
+    if (value.all(Char::isDigit)) {
+        return when (value.toInt()) {
+            0 -> "NotFilteredNotFound"
+            1 -> "NotFilteredWhiteList"
+            2 -> "NotFilteredError"
+            3 -> "FilteredBlackList"
+            4 -> "FilteredSafeBrowsing"
+            5 -> "FilteredParental"
+            6 -> "FilteredInvalid"
+            7 -> "FilteredSafeSearch"
+            8 -> "FilteredBlockedService"
+            9 -> "Rewrite"
+            10 -> "RewriteEtcHosts"
+            11 -> "RewriteRule"
+            else -> ""
+        }
+    }
+    return value
+}
+
+// 已知 reason 对应的核心显示文案,与核心 web UI(AGH 0.107.78)的
+// FILTERED_STATUS_TO_META_MAP + zh-cn 语言包保持一致:
+//   FilteredBlackList → 已拦截,FilteredBlockedService → 已阻止的服务,
+//   FilteredSafeBrowsing → 拦截的威胁,FilteredParental → 被家长控制阻止,
+//   FilteredSafeSearch → 安全搜索,Rewrite* → 重写项,
+//   NotFilteredWhiteList → 允许项,NotFilteredNotFound → 已处理。
+// 空值或未知值返回 null,由 querylog 分类筛选兜底。
+private fun queryReasonLabel(reason: String): String? = when (reason) {
+    "FilteredBlackList", "FilteredBlockList" -> "已拦截"
+    "FilteredBlockedService", "FilteredBlockingService" -> "已阻止的服务"
+    "FilteredSafeBrowsing" -> "拦截的威胁"
+    "FilteredParental" -> "被家长控制阻止"
+    "FilteredSafeSearch" -> "安全搜索"
+    "Rewrite", "RewriteRule", "RewriteEtcHosts" -> "重写项"
+    "NotFilteredWhiteList", "NotFilteredAllowList" -> "允许项"
+    "NotFilteredNotFound", "NotFiltered", "NotFilteredError" -> "已处理"
+    else -> null
+}
+
+// 查询日志条目的匹配键:同一时刻同一域名同一客户端的记录视为同一条。
+private fun queryEntryKey(row: JSONObject): String {
+    val name = row.optJSONObject("question")?.optString("name", "").orEmpty()
+    return row.optString("time", "") + "|" + name + "|" + row.optString("client", "")
+}
+
+// 把模块端 proxy-status 的原始输出(如 "waiting detected=0 managed=0")
+// 转成管理器里的可读状态,避免把 detected/managed 的内部计数当成启用状态展示。
+private fun proxyCompatStatusText(raw: String): String {
+    val line = raw.trim().lineSequence().firstOrNull()?.trim().orEmpty()
+    if (line.isEmpty()) return "代理兼容状态未知"
+    val managed = Regex("managed=(\\d+)").find(line)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+    return when {
+        line.startsWith("active") -> if (managed > 0) "已启用 · 兼容已生效（接管 $managed 个代理配置）" else "已启用 · 兼容已生效"
+        line.startsWith("waiting") || line == "waiting-for-proxy" -> "已启用 · 等待受支持的代理运行"
+        line.startsWith("disabled") -> "代理兼容未启用 · 添加订阅后自动开启"
+        line == "no-supported-config" -> "已启用 · 未检测到可兼容的代理配置"
+        line == "saved-sync-pending" -> "已启用 · 订阅已保存，等待代理运行时同步"
+        line == "helper-unavailable" -> "代理兼容组件不可用，请重新安装模块"
+        line == "busy" -> "代理兼容正在执行其他操作，请稍后重试"
+        else -> line
     }
 }
 

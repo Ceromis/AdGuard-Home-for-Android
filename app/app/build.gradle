@@ -17,8 +17,8 @@ android {
         // Miuix 0.9.3 依赖最低 Android 13,因此 minSdk 保留 33。
         minSdk 33
         targetSdk 35
-        versionCode 45
-        versionName '1.2.7'
+        versionCode 47
+        versionName '1.2.8-beta2'
         resValue 'string', 'app_name', 'AdGuard Home'
     }
 

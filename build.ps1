@@ -141,7 +141,7 @@ Copy-Item $appApk $distApk -Force
 $propPatch = Join-Path $dist 'module.prop'
 Copy-Item (Join-Path $module 'module.prop') $propPatch -Force
 
-$zipPath = Join-Path $dist 'AdGuardHome-Android-v1.2.7.zip'
+$zipPath = Join-Path $dist 'AdGuardHome-Android-v1.2.8-beta2.zip'
 & python $pyScriptPath $module $zipPath $distApk $propPatch
 Remove-Item -LiteralPath $propPatch -Force -ErrorAction SilentlyContinue
 
